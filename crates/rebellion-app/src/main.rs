@@ -15380,11 +15380,12 @@ async fn main() {
                             (point.0 - cockpit_layout.canvas.x) / cockpit_layout.scale,
                             (point.1 - cockpit_layout.canvas.y) / cockpit_layout.scale,
                         );
-                        if let Some(command) = rebellion_render::cockpit::message_index_command_at(
-                            cockpit_state.faction,
-                            logical,
-                        )
-                        .filter(|_| strategic_input_router.claim_root(event))
+                        if let Some(command) =
+                            rebellion_render::cockpit::message_index_click_command_at(
+                                cockpit_state.faction,
+                                logical,
+                            )
+                            .filter(|_| strategic_input_router.claim_root(event))
                         {
                             pending_index_command = Some(command);
                             strategic_input_router.set_application_hold_after(event);
@@ -15666,7 +15667,8 @@ async fn main() {
                             }
                         }
                     }
-                    // A rail light's click (0x136..0x13e) or F6 (0x75) opens
+                    // A rail light's click (0x136..0x13e), the partner droid's
+                    // (0x75, FUN_00422ce0 on WM_LBUTTONUP) or F6 (0x75) opens
                     // the Message Index on its category; FUN_0042a240 does
                     // nothing while one is open.
                     let index_command = pending_index_command.take();

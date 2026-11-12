@@ -1039,6 +1039,16 @@ pub fn agent_aperture(faction: CockpitFaction) -> (f32, f32, f32, f32) {
     })[0]
 }
 
+/// The partner droid's aperture, the smaller of the two (`FUN_0042adb0`:
+/// R2-D2 for the Alliance, SD-7 for the Empire), in 640 by 480 canvas points.
+#[must_use]
+pub fn partner_aperture(faction: CockpitFaction) -> (f32, f32, f32, f32) {
+    advisor_apertures(match faction {
+        CockpitFaction::Alliance => AdvisorFaction::Alliance,
+        CockpitFaction::Empire => AdvisorFaction::Empire,
+    })[1]
+}
+
 fn scaled_advisor_apertures(
     faction: AdvisorFaction,
     screen_width: f32,

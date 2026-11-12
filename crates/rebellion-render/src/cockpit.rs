@@ -823,6 +823,25 @@ pub fn message_index_command_at(faction: CockpitFaction, point: (f32, f32)) -> O
         .map(|control| control.command_id)
 }
 
+/// The command a left click on the partner droid's panel sends: `0x75`, F6's
+/// own, which opens the Message Index on All. `FUN_00422ce0` on
+/// `WM_LBUTTONUP` hit-tests panel `param_1[0x4b]` (`FUN_004420b0`) and jumps
+/// to case `0x75`, `FUN_0042a240(this, 1, 0x79)`.
+/// hyp: the panel is the smaller droid's aperture (`FUN_0042adb0`), as the
+/// agent's is the larger; right and bottom edges are exclusive.
+#[must_use]
+pub fn partner_droid_command_at(faction: CockpitFaction, point: (f32, f32)) -> Option<u16> {
+    let (x, y, width, height) = crate::advisor::partner_aperture(faction);
+    (point.0 >= x && point.0 < x + width && point.1 >= y && point.1 < y + height).then_some(0x75)
+}
+
+/// The Message Index command a root left click at a 640 by 480 canvas point
+/// sends: a rail light's own, else the partner droid's.
+#[must_use]
+pub fn message_index_click_command_at(faction: CockpitFaction, point: (f32, f32)) -> Option<u16> {
+    message_index_command_at(faction, point).or_else(|| partner_droid_command_at(faction, point))
+}
+
 /// Uniformly scaled strategic canvas and its transparent galaxy aperture.
 #[derive(Debug, Clone, Copy, PartialEq)]
 pub struct CockpitLayout {
@@ -2841,6 +2860,71 @@ mod tests {
         assert_eq!(
             controls[5].button,
             CockpitButton::GalacticInformationDisplay
+        );
+    }
+
+    #[test]
+    fn a_left_click_on_the_partner_droid_opens_the_message_index_on_all() {
+        // FUN_00422ce0, WM_LBUTTONUP (0x202): a hit on panel param_1[0x4b]
+        // (FUN_004420b0) jumps to case 0x75, FUN_0042a240(this, 1, 0x79).
+        // The panels are FUN_0042adb0's: R2-D2 (316, 411, 47, 69) and SD-7
+        // (302, 401, 101, 79).
+        for (faction, inside) in [
+            (CockpitFaction::Alliance, (340.0, 440.0)),
+            (CockpitFaction::Empire, (350.0, 440.0)),
+        ] {
+            assert_eq!(partner_droid_command_at(faction, inside), Some(0x75));
+            assert_eq!(
+                message_index_click_command_at(faction, inside)
+                    .and_then(crate::message_index::opening_category),
+                Some(0x79)
+            );
+        }
+    }
+
+    #[test]
+    fn a_left_click_beside_the_partner_droid_sends_nothing() {
+        // FUN_0042adb0's rects; right and bottom edges are outside.
+        for (faction, (x, y, width, height)) in [
+            (CockpitFaction::Alliance, (316.0, 411.0, 47.0, 69.0)),
+            (CockpitFaction::Empire, (302.0, 401.0, 101.0, 79.0)),
+        ] {
+            assert_eq!(partner_droid_command_at(faction, (x, y)), Some(0x75));
+            assert_eq!(
+                partner_droid_command_at(faction, (x + width - 0.5, y + height - 0.5)),
+                Some(0x75)
+            );
+            assert_eq!(partner_droid_command_at(faction, (x - 1.0, y)), None);
+            assert_eq!(partner_droid_command_at(faction, (x, y - 1.0)), None);
+            assert_eq!(partner_droid_command_at(faction, (x + width, y)), None);
+            assert_eq!(partner_droid_command_at(faction, (x, y + height)), None);
+        }
+    }
+
+    #[test]
+    fn a_left_click_on_the_agent_droid_opens_no_message_index() {
+        // FUN_00422ce0's WM_LBUTTONUP tests param_1[0x4b] alone; the agent's
+        // panel (param_1[0x4a]) answers the right button only.
+        assert_eq!(
+            message_index_click_command_at(CockpitFaction::Alliance, (560.0, 400.0)),
+            None
+        );
+        assert_eq!(
+            message_index_click_command_at(CockpitFaction::Empire, (50.0, 400.0)),
+            None
+        );
+    }
+
+    #[test]
+    fn a_rail_light_keeps_its_own_command_beside_the_partner_droid() {
+        // FUN_00427270: Alliance 0x136 at (3, 109), Empire 0x13e at (611, 310).
+        assert_eq!(
+            message_index_click_command_at(CockpitFaction::Alliance, (3.0, 109.0)),
+            Some(0x136)
+        );
+        assert_eq!(
+            message_index_click_command_at(CockpitFaction::Empire, (611.0, 310.0)),
+            Some(0x13e)
         );
     }
 
