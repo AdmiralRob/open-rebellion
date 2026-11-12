@@ -15345,7 +15345,7 @@ async fn main() {
                         let agent_anchor = speed_anchor
                             .is_none()
                             .then(|| {
-                                rebellion_render::agent_menu::agent_menu_anchor(
+                                rebellion_render::agent_menu::droid_menu_anchor(
                                     cockpit_layout,
                                     cockpit_state.faction,
                                     point,
@@ -15643,27 +15643,84 @@ async fn main() {
                         production: player_agent.is_running(AutomationModule::Production),
                         advice: player_agent.advice(),
                     };
-                    match rebellion_render::agent_menu::draw_owned_agent_menu(
-                        ctx,
-                        &agent_menu_state,
-                        &mut bmp_cache,
-                        cockpit_layout,
-                        cockpit_state.faction,
-                        agent_view,
-                        managed_menu_input_enabled,
-                    ) {
-                        OwnedMenuOutcome::Open => {}
-                        OwnedMenuOutcome::Dismissed => {
-                            if let Some(window) = managed_menu.request_close() {
-                                strategic_windowing
-                                    .enqueue(rebellion_windowing::WindowCommand::Close(window));
+                    // FUN_0042d050: the partner droid's panel fills the popup
+                    // from 0xbeef (Message Alerts), the agent's from 0xdead.
+                    let message_alerts_open = agent_menu_state.anchor.is_some_and(|anchor| {
+                        rebellion_render::agent_menu::droid_menu_list_at(
+                            cockpit_state.faction,
+                            anchor,
+                        ) == Some(rebellion_render::agent_menu::DroidMenuList::MessageAlerts)
+                    });
+                    if message_alerts_open {
+                        use rebellion_render::agent_menu::MessageAlertsCommand;
+                        let items = rebellion_render::agent_menu::message_alerts_items(|mask| {
+                            msg_log.post_flags(mask)
+                        });
+                        match rebellion_render::agent_menu::draw_owned_message_alerts_menu(
+                            ctx,
+                            &agent_menu_state,
+                            &mut bmp_cache,
+                            cockpit_layout,
+                            cockpit_state.faction,
+                            &items,
+                            managed_menu_input_enabled,
+                        ) {
+                            OwnedMenuOutcome::Open => {}
+                            OwnedMenuOutcome::Dismissed => {
+                                if let Some(window) = managed_menu.request_close() {
+                                    strategic_windowing
+                                        .enqueue(rebellion_windowing::WindowCommand::Close(window));
+                                }
+                            }
+                            OwnedMenuOutcome::Chosen(command) => {
+                                match command {
+                                    // FUN_00486fb0 case 0x11c: FUN_0041d770(1, 0x79).
+                                    MessageAlertsCommand::Messages => {
+                                        pending_index_command = Some(0x75);
+                                    }
+                                    MessageAlertsCommand::ToggleAlert { mask } => {
+                                        let flags =
+                                            rebellion_render::agent_menu::toggled_alert_flags(
+                                                msg_log.post_flags(mask),
+                                            );
+                                        msg_log.set_post_flags(mask, flags);
+                                        macroquad::logging::info!(
+                                            "[message_alerts] post_flags mask=0x{:x} silent={}",
+                                            mask,
+                                            flags & rebellion_render::message_log::POST_SILENTLY
+                                                != 0
+                                        );
+                                    }
+                                }
+                                if let Some(window) = managed_menu.request_close() {
+                                    strategic_windowing
+                                        .enqueue(rebellion_windowing::WindowCommand::Close(window));
+                                }
                             }
                         }
-                        OwnedMenuOutcome::Chosen(command) => {
-                            apply_agent_command(&mut player_agent, command, "menu");
-                            if let Some(window) = managed_menu.request_close() {
-                                strategic_windowing
-                                    .enqueue(rebellion_windowing::WindowCommand::Close(window));
+                    } else {
+                        match rebellion_render::agent_menu::draw_owned_agent_menu(
+                            ctx,
+                            &agent_menu_state,
+                            &mut bmp_cache,
+                            cockpit_layout,
+                            cockpit_state.faction,
+                            agent_view,
+                            managed_menu_input_enabled,
+                        ) {
+                            OwnedMenuOutcome::Open => {}
+                            OwnedMenuOutcome::Dismissed => {
+                                if let Some(window) = managed_menu.request_close() {
+                                    strategic_windowing
+                                        .enqueue(rebellion_windowing::WindowCommand::Close(window));
+                                }
+                            }
+                            OwnedMenuOutcome::Chosen(command) => {
+                                apply_agent_command(&mut player_agent, command, "menu");
+                                if let Some(window) = managed_menu.request_close() {
+                                    strategic_windowing
+                                        .enqueue(rebellion_windowing::WindowCommand::Close(window));
+                                }
                             }
                         }
                     }
