@@ -50,7 +50,7 @@ use rand::seq::SliceRandom;
 use rand::{Rng, SeedableRng};
 use rand_xoshiro::Xoshiro256PlusPlus;
 use rebellion_core::dat::{ExplorationStatus, Faction, SectorGroup};
-use rebellion_core::ids::{CapitalShipKey, DatId, FighterKey, FleetKey, SystemKey};
+use rebellion_core::ids::{CapitalShipKey, CharacterKey, DatId, FighterKey, FleetKey, SystemKey};
 use rebellion_core::world::{
     ControlKind, DefenseFacilityInstance, FighterEntry, Fleet, ForceTier, GameWorld,
     ManufacturingFacilityInstance, ProductionFacilityInstance, SeedOptions, ShipInstance,
@@ -350,7 +350,6 @@ pub fn apply_seeds_with_rng<R: Rng + ?Sized>(
 
     // ── Character stat rolling + placement ──────────────────────────────────
     roll_character_stats(world, rng);
-    place_named_characters(world, &special);
 
     // ── M5: Procedural control buckets, population, and support ──────────
     let bucket_map = assign_control_buckets(world, &special, seed_options, rng);
@@ -371,6 +370,9 @@ pub fn apply_seeds_with_rng<R: Rng + ?Sized>(
     seed_low_support_garrisons(world, seed_options, rng);
     assign_facility_sides(world);
     seed_maintenance_budget_units(world, seed_options, cmunem.as_ref(), cmunal.as_ref(), rng);
+
+    // ── Stage 0x15: the named characters and the extra recruits ──────────
+    place_named_characters(world, &special, seed_options, rng);
 
     // Every seeded capital ship now exists; number them (FUN_00517760).
     world.number_capital_ships();
@@ -758,7 +760,14 @@ fn assign_control_buckets<R: Rng + ?Sized>(
     core_systems.sort_by_key(|&k| world.systems.get(k).map_or(0, |s| s.dat_id.raw()));
     core_systems.shuffle(rng);
 
-    let core_count = core_systems.len() as i32;
+    // FUN_00519d00 sizes the buckets from every core system, Coruscant
+    // included; the Empire's strong bucket then gives one place to Coruscant.
+    let coruscant_is_core = world
+        .systems
+        .get(special.coruscant)
+        .and_then(|sys| world.sectors.get(sys.sector))
+        .is_some_and(|sector| sector.group == SectorGroup::Core);
+    let core_count = core_systems.len() as i32 + i32::from(coruscant_is_core);
 
     // SDPRTB 7680 = strong support percentage, 7681 = weak support percentage.
     let alliance_strong_pct = world.sdprtb.value(7680, diff, Faction::Alliance);
@@ -1139,46 +1148,52 @@ fn initialize_energy_and_raw_materials<R: Rng + ?Sized>(
     }
 }
 
-/// Weighted facility entry parsed from SYFCCRTB/SYFCRMTB.
+/// One SYFCCRTB/SYFCRMTB entry: the class placed when the roll reaches its key.
 struct FacilityWeight {
-    /// Cumulative weight threshold (0-99 range).
-    cumulative_weight: u32,
-    /// Packed facility id: `(family_byte << 24) | index`.
+    /// The lowest roll that selects this entry (`+0x20`; the table is sorted).
+    key: u32,
+    /// Packed facility id `(family_byte << 24) | index`; 0 places nothing.
     facility_id: u32,
 }
 
-/// Parse SYFC table entries into a sorted list of (`cumulative_weight`, `facility_id`).
+/// Parse SYFC table entries in table order, keeping the null entry: a roll
+/// below the first real key lands on it and places nothing.
 fn parse_facility_weights(table: Option<&SyfcTableFile>) -> Vec<FacilityWeight> {
     let Some(table) = table else {
         return Vec::new();
     };
-    table
+    let mut weights: Vec<FacilityWeight> = table
         .entries
         .iter()
-        .filter(|e| e.facility != 0) // Skip null entry
         .map(|e| FacilityWeight {
-            // The system_id field is actually the cumulative weight percentage.
-            cumulative_weight: e.system_id,
+            // The record's id field holds the entry's roll key.
+            key: e.system_id,
             facility_id: e.facility,
         })
-        .collect()
+        .collect();
+    weights.sort_by_key(|w| w.key);
+    weights
 }
 
-/// Pick a weighted random facility from the weight table.
+/// The facility class a roll selects: the last entry whose key is at most the
+/// roll, or the first entry when the roll is below every key
+/// (`FUN_0055bed0` -> `FUN_00595090`). A null entry places nothing.
+fn facility_for_roll(weights: &[FacilityWeight], roll: u32) -> Option<u32> {
+    let entry = weights
+        .iter()
+        .rev()
+        .find(|w| w.key <= roll)
+        .or_else(|| weights.first())?;
+    (entry.facility_id != 0).then_some(entry.facility_id)
+}
+
+/// Roll a facility from the table: `rand(100)` is inclusive, 0..=100
+/// (`FUN_00559850` / `FUN_00559a60` -> `FUN_0053e290(100)`).
 fn pick_weighted_facility<R: Rng + ?Sized>(weights: &[FacilityWeight], rng: &mut R) -> Option<u32> {
     if weights.is_empty() {
         return None;
     }
-    let max_weight = weights.last().map_or(100, |w| w.cumulative_weight);
-    if max_weight == 0 {
-        return None;
-    }
-    let roll = rng.gen_range(0..max_weight);
-    // Find the first entry whose cumulative weight exceeds the roll.
-    weights
-        .iter()
-        .find(|w| roll < w.cumulative_weight)
-        .map(|w| w.facility_id)
+    facility_for_roll(weights, rng.gen_range(0..=100u32))
 }
 
 /// Generate procedural facilities for all populated systems based on energy slots.
@@ -1187,7 +1202,8 @@ fn pick_weighted_facility<R: Rng + ?Sized>(weights: &[FacilityWeight], rng: &mut
 /// 1. Compute mine chance: `(total_raw - current_mines) * mine_multiplier`
 ///    where `mine_multiplier` is GNPRTB 7766 (core=4) or 7767 (rim=2).
 /// 2. If random(0..100) < `mine_chance`, place a mine (production facility).
-/// 3. Otherwise, pick a weighted random facility from SYFCCRTB (core) or SYFCRMTB (rim).
+/// 3. Otherwise, roll SYFCCRTB (core) or SYFCRMTB (rim); its null entry
+///    places nothing (`facility_for_roll`).
 /// 4. Post-adjust: ensure energy >= `used_energy`, raw >= `mine_count`.
 #[expect(
     clippy::cast_sign_loss,
@@ -1672,39 +1688,172 @@ fn roll_skill_pair<R: Rng + ?Sized>(pair: &mut SkillPair, rng: &mut R) {
     }
 }
 
-/// Place named characters at their starting systems.
-///
-/// Per the original game:
-/// - Luke Skywalker, Leia Organa, Han Solo, Wedge Antilles, Chewbacca,
-///   and Jan Dodonna are placed at Yavin.
-/// - Mon Mothma is placed at the Rebel HQ (random rim system).
-/// - Emperor Palpatine and Darth Vader are placed at Coruscant.
-fn place_named_characters(world: &mut GameWorld, special: &SpecialSystems) {
-    // Alliance characters at Yavin
-    const YAVIN_CHARACTERS: &[&str] = &[
-        "Luke Skywalker",
-        "Leia Organa",
-        "Han Solo",
-        "Wedge Antilles",
-        "Chewbacca",
-        "Jan Dodonna",
-    ];
+/// Characters stage 0x15 (`FUN_0055f7b0`) places at a fixed system: Palpatine
+/// at Coruscant, Mon Mothma at the Alliance HQ, and Luke, Leia, Han and minors
+/// `0x38000343`, `0x38000344`, `0x38000341` at Yavin, in that order.
+const PALPATINE: u32 = 0x3400_0280;
+const MON_MOTHMA: u32 = 0x3000_0240;
+const YAVIN_CHARACTERS: [u32; 6] = [
+    0x3200_0242,
+    0x3100_0241,
+    0x3300_0243,
+    0x3800_0343,
+    0x3800_0344,
+    0x3800_0341,
+];
+/// Characters `FUN_0055f7b0` sends to a random container of their side
+/// (`FUN_00562680`): Vader and minors `0x38000380`-`0x38000383`, `0x3800038c`.
+const IMPERIAL_ROAMERS: [u32; 6] = [
+    0x3500_0281,
+    0x3800_0380,
+    0x3800_0381,
+    0x3800_0382,
+    0x3800_0383,
+    0x3800_038c,
+];
 
-    // Alliance character at Rebel HQ
-    const REBEL_HQ_CHARACTERS: &[&str] = &["Mon Mothma"];
+/// Where a placed character starts: a system, or a fleet at its system.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum StartPost {
+    System(SystemKey),
+    Fleet(FleetKey),
+}
 
-    // Empire characters at Coruscant
-    const CORUSCANT_CHARACTERS: &[&str] = &["Emperor Palpatine", "Darth Vader"];
+/// SDPRTB row of each side's extra starting recruits, by galaxy size
+/// (`FUN_0055cb60` reads 0x1400-0x1402 into `DAT_006bb5f8`.. ; `FUN_0055d7d0`
+/// picks the row by the galaxy size at `+0x5c`).
+const fn starting_recruits_param(size: rebellion_core::dat::GalaxySize) -> u16 {
+    match size {
+        rebellion_core::dat::GalaxySize::Standard => 5120,
+        rebellion_core::dat::GalaxySize::Large => 5121,
+        rebellion_core::dat::GalaxySize::Huge => 5122,
+    }
+}
 
-    for (_, character) in &mut world.characters {
-        let name = character.name.as_str();
+/// A uniform pick over `side`'s controlled systems and then its fleets
+/// (`FUN_00562710`: `rand(systems + fleets - 1)`). port: the original walks
+/// its containers in object order; the port walks both by `DatId`/key order.
+/// hyp: a fleet pick boards the fleet itself; the original rolls a capital
+/// ship inside it (`FUN_00502e30`), and the port keeps characters per fleet.
+fn random_start_post<R: Rng + ?Sized>(
+    world: &GameWorld,
+    side: Faction,
+    rng: &mut R,
+) -> Option<StartPost> {
+    let mut systems: Vec<(u32, SystemKey)> = world
+        .systems
+        .iter()
+        .filter(|(_, sys)| sys.control.is_controlled_by(side))
+        .map(|(k, sys)| (sys.dat_id.raw(), k))
+        .collect();
+    systems.sort_by_key(|&(id, _)| id);
+    let fleets: Vec<FleetKey> = world
+        .fleets
+        .iter()
+        .filter(|(_, fleet)| fleet.is_alliance == (side == Faction::Alliance))
+        .map(|(k, _)| k)
+        .collect();
+    let total = systems.len() + fleets.len();
+    if total == 0 {
+        return None;
+    }
+    let roll = rng.gen_range(0..total);
+    Some(match systems.get(roll) {
+        Some(&(_, system)) => StartPost::System(system),
+        None => StartPost::Fleet(fleets[roll - systems.len()]),
+    })
+}
 
-        if YAVIN_CHARACTERS.contains(&name) {
-            character.current_system = Some(special.yavin);
-        } else if REBEL_HQ_CHARACTERS.contains(&name) {
-            character.current_system = Some(special.rebel_hq);
-        } else if CORUSCANT_CHARACTERS.contains(&name) {
-            character.current_system = Some(special.coruscant);
+/// Put `character` at `post` as one of its side's (`FUN_0055fe70`), marking
+/// it recruited (`+0x50` bit 1).
+fn place_character(world: &mut GameWorld, character: CharacterKey, post: StartPost) {
+    let (system, fleet) = match post {
+        StartPost::System(system) => (system, None),
+        StartPost::Fleet(fleet) => {
+            let Some(f) = world.fleets.get_mut(fleet) else {
+                return;
+            };
+            if !f.characters.contains(&character) {
+                f.characters.push(character);
+            }
+            (f.location, Some(fleet))
+        }
+    };
+    if let Some(c) = world.characters.get_mut(character) {
+        c.current_system = Some(system);
+        c.current_fleet = fleet;
+        c.recruited = true;
+    }
+}
+
+/// Stage 0x15, `FUN_0055f7b0`: the named characters, then each side's extra
+/// recruits, Empire first. Runs after the forces and control are seeded, so
+/// the random posts see every system and fleet of the side.
+fn place_named_characters<R: Rng + ?Sized>(
+    world: &mut GameWorld,
+    special: &SpecialSystems,
+    seed_options: &SeedOptions,
+    rng: &mut R,
+) {
+    // MJCHARSD/MNCHARSD ids carry no family byte; match the record index
+    // (`DatId::is_record`).
+    let by_index: HashMap<u32, CharacterKey> = world
+        .characters
+        .iter()
+        .map(|(k, c)| (c.dat_id.index(), k))
+        .collect();
+    let find = |id: u32| by_index.get(&DatId::new(id).index()).copied();
+
+    if let Some(palpatine) = find(PALPATINE) {
+        place_character(world, palpatine, StartPost::System(special.coruscant));
+    }
+    for id in IMPERIAL_ROAMERS {
+        let Some(character) = find(id) else {
+            continue;
+        };
+        if let Some(post) = random_start_post(world, Faction::Empire, rng) {
+            place_character(world, character, post);
+        }
+    }
+    place_extra_recruits(world, Faction::Empire, seed_options, rng);
+
+    if let Some(mothma) = find(MON_MOTHMA) {
+        place_character(world, mothma, StartPost::System(special.rebel_hq));
+    }
+    for id in YAVIN_CHARACTERS {
+        if let Some(character) = find(id) {
+            place_character(world, character, StartPost::System(special.yavin));
+        }
+    }
+    place_extra_recruits(world, Faction::Alliance, seed_options, rng);
+}
+
+/// `FUN_0055d7d0` recruits per side, each a random character of the side's
+/// recruit pool (`FUN_0055fc80`: `rand(pool - 1)`) at a random post of the
+/// side (`FUN_00562610` -> `FUN_00562710`). The post is rolled first.
+fn place_extra_recruits<R: Rng + ?Sized>(
+    world: &mut GameWorld,
+    side: Faction,
+    seed_options: &SeedOptions,
+    rng: &mut R,
+) {
+    let count = world.sdprtb.value(
+        starting_recruits_param(seed_options.galaxy_size),
+        seed_options.gnprtb_index(),
+        side,
+    );
+    for _ in 0..count.max(0) {
+        let Some(post) = random_start_post(world, side, rng) else {
+            return;
+        };
+        let pool = rebellion_core::missions::recruit_pool(world, side);
+        if pool.is_empty() {
+            return;
+        }
+        let pick = pool[rng.gen_range(0..pool.len())];
+        place_character(world, pick, post);
+        if pool.len() == 1 {
+            world.set_recruit_pool_empty(side);
         }
     }
 }
@@ -2554,51 +2703,44 @@ mod tests {
         assert!(yavin_key.is_some(), "Yavin must exist");
         assert!(rebel_hq_key.is_some(), "Rebel HQ must exist");
 
-        // Check Alliance characters at Yavin
-        for name in &[
-            "Luke Skywalker",
-            "Leia Organa",
-            "Han Solo",
-            "Wedge Antilles",
-            "Chewbacca",
-            "Jan Dodonna",
+        // FUN_0055f7b0: Luke, Leia, Han and minors 0x341/0x343/0x344 at
+        // Yavin, Mon Mothma at the HQ, Palpatine at Coruscant. Vader starts
+        // at a random Imperial post, so only his side is pinned here.
+        let at = |id: u32| {
+            world
+                .characters
+                .values()
+                .find(|c| c.dat_id.is_record(id))
+                .unwrap_or_else(|| panic!("{id:#x} missing from the character DATs"))
+        };
+        for id in [
+            0x3200_0242,
+            0x3100_0241,
+            0x3300_0243,
+            0x3800_0341,
+            0x3800_0343,
+            0x3800_0344,
         ] {
-            let (_, ch) = world
-                .characters
-                .iter()
-                .find(|(_, c)| c.name == *name)
-                .unwrap_or_else(|| panic!("{name} missing from TEXTSTRA.DLL names"));
             assert_eq!(
-                ch.current_system, yavin_key,
-                "{} should be at Yavin, but is at {:?}",
-                name, ch.current_system
+                at(id).current_system,
+                yavin_key,
+                "{id:#x} should start at Yavin"
             );
         }
-
-        // Check Mon Mothma at Rebel HQ
-        let (_, mm) = world
-            .characters
-            .iter()
-            .find(|(_, c)| c.name == "Mon Mothma")
-            .expect("Mon Mothma missing from TEXTSTRA.DLL names");
         assert_eq!(
-            mm.current_system, rebel_hq_key,
-            "Mon Mothma should be at Rebel HQ"
+            at(0x3000_0240).current_system,
+            rebel_hq_key,
+            "Mon Mothma at the HQ"
         );
-
-        // Check Empire characters at Coruscant
-        for name in &["Emperor Palpatine", "Darth Vader"] {
-            let (_, ch) = world
-                .characters
-                .iter()
-                .find(|(_, c)| c.name == *name)
-                .unwrap_or_else(|| panic!("{name} missing from TEXTSTRA.DLL names"));
-            assert_eq!(
-                ch.current_system, coruscant_key,
-                "{} should be at Coruscant, but is at {:?}",
-                name, ch.current_system
-            );
-        }
+        assert_eq!(
+            at(0x3400_0280).current_system,
+            coruscant_key,
+            "Palpatine at Coruscant"
+        );
+        let vader = at(0x3500_0281).current_system.expect("Vader starts placed");
+        assert!(world.systems[vader]
+            .control
+            .is_controlled_by(Faction::Empire));
     }
 
     #[test]
@@ -2840,13 +2982,14 @@ mod tests {
 
         // Medium difficulty reads SDPRTB 7680 (strong: Alliance 20%, Empire 25%)
         // and 7681 (weak: Alliance 0%, Empire 10%); each bucket is
-        // floor(core * pct / 100). The Alliance keeps exactly its buckets. The
+        // floor(core * pct / 100) over every core system, Coruscant included
+        // (FUN_00519d00). The Alliance keeps exactly its buckets. The
         // Empire's count is not pinned: the post-load pass in lib.rs also gives
         // it every neutral system that holds only Empire assets.
         assert!(total_core > 0, "Should have core systems");
         assert_eq!(
             alliance_controlled,
-            total_core * 20 / 100,
+            (total_core + 1) * 20 / 100,
             "Alliance core control (got {alliance_controlled}/{total_core})"
         );
         assert!(
@@ -3092,5 +3235,264 @@ mod tests {
         assert_eq!(maintenance_budget_param(GalaxySize::Standard), 5168);
         assert_eq!(maintenance_budget_param(GalaxySize::Large), 5169);
         assert_eq!(maintenance_budget_param(GalaxySize::Huge), 5170);
+    }
+
+    fn sd(id: u16, alliance: i32, empire: i32) -> rebellion_core::world::SdprtbEntry {
+        rebellion_core::world::SdprtbEntry {
+            parameter_id: u32::from(id),
+            dev_alliance: alliance,
+            dev_empire: empire,
+            alliance_sp_easy_alliance: alliance,
+            alliance_sp_easy_empire: empire,
+            alliance_sp_medium_alliance: alliance,
+            alliance_sp_medium_empire: empire,
+            alliance_sp_hard_alliance: alliance,
+            alliance_sp_hard_empire: empire,
+            empire_sp_easy_alliance: alliance,
+            empire_sp_easy_empire: empire,
+            empire_sp_medium_alliance: alliance,
+            empire_sp_medium_empire: empire,
+            empire_sp_hard_alliance: alliance,
+            empire_sp_hard_empire: empire,
+            multiplayer_alliance: alliance,
+            multiplayer_empire: empire,
+        }
+    }
+
+    fn group_sector(world: &mut GameWorld, group: SectorGroup) -> rebellion_core::ids::SectorKey {
+        world.sectors.insert(rebellion_core::world::Sector {
+            dat_id: DatId::new(0x8000_0001),
+            name: "Here".into(),
+            group,
+            x: 0,
+            y: 0,
+            systems: vec![],
+        })
+    }
+
+    /// The shipped SYFCCRTB (core) and SYFCRMTB (rim) keys and classes.
+    fn syfc(entries: &[(u32, u32)]) -> Vec<FacilityWeight> {
+        entries
+            .iter()
+            .map(|&(key, facility_id)| FacilityWeight { key, facility_id })
+            .collect()
+    }
+
+    /// `FUN_00559850` rolls `FUN_0053e290(100)` (0..=100) and
+    /// `FUN_0055bed0` -> `FUN_00595090` takes the last entry whose key is at
+    /// most the roll; the key-0 entry holds no class and places nothing.
+    #[test]
+    fn a_syfc_roll_takes_the_last_entry_at_or_below_it_and_the_null_entry_places_nothing() {
+        let core = syfc(&[
+            (0, 0),
+            (36, 0x2d00_0002),
+            (79, 0x2800_0001),
+            (82, 0x2900_0002),
+            (85, 0x2a00_0003),
+            (88, 0x2400_0003),
+            (96, 0x2300_0002),
+            (99, 0x2200_0001),
+        ]);
+        assert_eq!(facility_for_roll(&core, 0), None);
+        assert_eq!(facility_for_roll(&core, 35), None);
+        assert_eq!(facility_for_roll(&core, 36), Some(0x2d00_0002));
+        assert_eq!(facility_for_roll(&core, 78), Some(0x2d00_0002));
+        assert_eq!(facility_for_roll(&core, 79), Some(0x2800_0001));
+        assert_eq!(facility_for_roll(&core, 81), Some(0x2800_0001));
+        assert_eq!(facility_for_roll(&core, 100), Some(0x2200_0001));
+
+        let rim = syfc(&[
+            (0, 0),
+            (91, 0x2d00_0002),
+            (96, 0x2800_0001),
+            (97, 0x2900_0002),
+            (98, 0x2a00_0003),
+            (99, 0x2400_0003),
+            (100, 0x2300_0002),
+        ]);
+        assert_eq!(facility_for_roll(&rim, 90), None);
+        assert_eq!(facility_for_roll(&rim, 91), Some(0x2d00_0002));
+        assert_eq!(facility_for_roll(&rim, 95), Some(0x2d00_0002));
+        assert_eq!(facility_for_roll(&rim, 100), Some(0x2300_0002));
+    }
+
+    /// `FUN_00519d00` sizes each bucket as `n * pct / 100` over every core
+    /// system, Coruscant included, and takes one Empire strong place for
+    /// Coruscant. Easy (SDPRTB 7680 10/10, 7681 0/4) over 30 core systems:
+    /// three Alliance, two Empire strong and one Empire weak.
+    #[test]
+    fn the_control_buckets_count_coruscant_among_the_core_systems_for_both_sides() {
+        let mut world = GameWorld::default();
+        world.sdprtb =
+            rebellion_core::world::SdprtbParams::new(vec![sd(7680, 10, 10), sd(7681, 0, 4)]);
+        let core = group_sector(&mut world, SectorGroup::Core);
+        let rim = group_sector(&mut world, SectorGroup::RimOuter);
+        let coruscant = bare_system(&mut world, ControlKind::Controlled(Faction::Empire));
+        world.systems[coruscant].sector = core;
+        let yavin = bare_system(&mut world, ControlKind::Controlled(Faction::Alliance));
+        world.systems[yavin].sector = rim;
+        let hq = bare_system(&mut world, ControlKind::Controlled(Faction::Alliance));
+        world.systems[hq].sector = rim;
+        for _ in 0..29 {
+            let key = bare_system(&mut world, ControlKind::Uncontrolled);
+            world.systems[key].sector = core;
+        }
+        let special = SpecialSystems {
+            coruscant,
+            yavin,
+            rebel_hq: hq,
+            rebel_hq_seq_id: 0,
+        };
+        let mut rng = Xoshiro256PlusPlus::seed_from_u64(7);
+
+        let buckets =
+            assign_control_buckets(&mut world, &special, &SeedOptions::default(), &mut rng);
+
+        let count = |bucket| buckets.values().filter(|b| **b == bucket).count();
+        assert_eq!(count(ControlBucket::AllianceStrong), 3);
+        assert_eq!(count(ControlBucket::AllianceWeak), 0);
+        assert_eq!(count(ControlBucket::EmpireStrong), 2);
+        assert_eq!(count(ControlBucket::EmpireWeak), 1);
+        assert_eq!(count(ControlBucket::Neutral), 23);
+    }
+
+    /// Stage 0x15 (`FUN_0055f7b0`): Palpatine at Coruscant, Mon Mothma at the
+    /// HQ, Luke, Leia, Han and minors 0x341/0x343/0x344 at Yavin; Vader and
+    /// minors 0x380-0x383, 0x38c each at a random system or fleet of the
+    /// Empire (`FUN_00562680` -> `FUN_00562710`); then `FUN_0055d7d0` extra
+    /// recruits per side, SDPRTB 5120-5122 by galaxy size, each from the
+    /// side's pool at a random post of the side (`FUN_00562610`).
+    #[test]
+    fn stage_0x15_places_the_named_characters_and_each_sides_extra_recruits() {
+        use rebellion_core::world::{Character, Fleet};
+        let mut world = GameWorld::default();
+        world.sdprtb = rebellion_core::world::SdprtbParams::new(vec![
+            sd(5120, 1, 1),
+            sd(5121, 2, 3),
+            sd(5122, 4, 4),
+        ]);
+        let coruscant = bare_system(&mut world, ControlKind::Controlled(Faction::Empire));
+        let imperial = bare_system(&mut world, ControlKind::Controlled(Faction::Empire));
+        let yavin = bare_system(&mut world, ControlKind::Controlled(Faction::Alliance));
+        let hq = bare_system(&mut world, ControlKind::Controlled(Faction::Alliance));
+        let rebel = bare_system(&mut world, ControlKind::Controlled(Faction::Alliance));
+        let neutral = bare_system(&mut world, ControlKind::Uncontrolled);
+        let imperial_fleet = world.fleets.insert(Fleet {
+            location: imperial,
+            is_alliance: false,
+            ..Fleet::default()
+        });
+        let rebel_fleet = world.fleets.insert(Fleet {
+            location: rebel,
+            is_alliance: true,
+            ..Fleet::default()
+        });
+        let mut add = |id: u32, is_alliance: bool, is_major: bool| {
+            world.characters.insert(Character {
+                // MJCHARSD/MNCHARSD store the bare index.
+                dat_id: DatId::new(id & 0x00ff_ffff),
+                is_alliance,
+                is_empire: !is_alliance,
+                is_major,
+                ..Character::default()
+            })
+        };
+        let palpatine = add(0x3400_0280, false, true);
+        let mothma = add(0x3000_0240, true, true);
+        let mut yavin_group = Vec::new();
+        for id in [0x3200_0242, 0x3100_0241, 0x3300_0243] {
+            yavin_group.push(add(id, true, true));
+        }
+        for id in [0x3800_0341, 0x3800_0343, 0x3800_0344] {
+            yavin_group.push(add(id, true, false));
+        }
+        let mut roamers = vec![add(0x3500_0281, false, true)];
+        for id in [
+            0x3800_0380,
+            0x3800_0381,
+            0x3800_0382,
+            0x3800_0383,
+            0x3800_038c,
+        ] {
+            roamers.push(add(id, false, false));
+        }
+        let rebel_pool: Vec<CharacterKey> = (0x350..0x358)
+            .map(|i| add(0x3800_0000 | i, true, false))
+            .collect();
+        let imperial_pool: Vec<CharacterKey> = (0x390..0x398)
+            .map(|i| add(0x3800_0000 | i, false, false))
+            .collect();
+        let special = SpecialSystems {
+            coruscant,
+            yavin,
+            rebel_hq: hq,
+            rebel_hq_seq_id: 0,
+        };
+        let seed_options = SeedOptions {
+            galaxy_size: rebellion_core::dat::GalaxySize::Large,
+            ..SeedOptions::default()
+        };
+        let mut rng = Xoshiro256PlusPlus::seed_from_u64(11);
+
+        place_named_characters(&mut world, &special, &seed_options, &mut rng);
+
+        let at = |key: CharacterKey| {
+            let c = &world.characters[key];
+            assert!(c.recruited, "a placed character counts as recruited");
+            (c.current_system, c.current_fleet)
+        };
+        assert_eq!(at(palpatine), (Some(coruscant), None));
+        assert_eq!(at(mothma), (Some(hq), None));
+        for key in yavin_group {
+            assert_eq!(at(key), (Some(yavin), None));
+        }
+        let imperial_posts = [
+            (Some(coruscant), None),
+            (Some(imperial), None),
+            (Some(imperial), Some(imperial_fleet)),
+        ];
+        let rebel_posts = [
+            (Some(yavin), None),
+            (Some(hq), None),
+            (Some(rebel), None),
+            (Some(rebel), Some(rebel_fleet)),
+        ];
+        for key in roamers {
+            assert!(imperial_posts.contains(&at(key)), "{:?}", at(key));
+        }
+        let placed = |pool: &[CharacterKey], posts: &[(Option<SystemKey>, Option<FleetKey>)]| {
+            pool.iter()
+                .filter(|&&key| world.characters[key].current_system.is_some())
+                .inspect(|&&key| assert!(posts.contains(&at(key))))
+                .count()
+        };
+        // SDPRTB 5121, the Large galaxy row: two Alliance, three Empire.
+        assert_eq!(placed(&rebel_pool, &rebel_posts), 2);
+        assert_eq!(placed(&imperial_pool, &imperial_posts), 3);
+        assert!(
+            world
+                .characters
+                .values()
+                .all(|c| c.current_system != Some(neutral)),
+            "no one starts at a system neither side holds"
+        );
+        for (fleet, side_posts) in [
+            (imperial_fleet, &imperial_posts[..]),
+            (rebel_fleet, &rebel_posts[..]),
+        ] {
+            for &key in &world.fleets[fleet].characters {
+                assert!(side_posts.contains(&at(key)));
+                assert_eq!(world.characters[key].current_fleet, Some(fleet));
+            }
+        }
+    }
+
+    #[test]
+    fn each_galaxy_size_reads_its_own_starting_recruits_row() {
+        use rebellion_core::dat::GalaxySize;
+        // FUN_0055cb60 loads SDPRTB 0x1400-0x1402 for FUN_0055d7d0's sizes 1-3.
+        assert_eq!(starting_recruits_param(GalaxySize::Standard), 5120);
+        assert_eq!(starting_recruits_param(GalaxySize::Large), 5121);
+        assert_eq!(starting_recruits_param(GalaxySize::Huge), 5122);
     }
 }
