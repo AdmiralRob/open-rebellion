@@ -35,6 +35,7 @@ use crate::fleet_window::{
     control_side, drag_image_of, faction_side, fleet_side, mini_layers, paint_native, MiniObject,
     DRAG_DISTANCE_SQUARED,
 };
+use crate::list_selection::{ListSelection, Modifiers};
 use crate::object_menu::MenuObject;
 use crate::panels::fleets::fighter_mini_id;
 use crate::quadrant_icons::{mission_keys, system_members};
@@ -177,7 +178,30 @@ pub enum DefensesItem {
     Defense(DefenseFacilityKey),
 }
 
+#[cfg(test)]
+impl OpenDefensesWindow {
+    /// The one selected row, for tests that select one at a time.
+    fn selected(&self) -> Option<DefensesItem> {
+        assert!(self.selection.items().len() <= 1, "{:?}", self.selection);
+        self.selection.items().first().copied()
+    }
+}
+
 impl DefensesItem {
+    /// Whether `self` moves in one drop with `other`: characters and special
+    /// forces together (one `0x241` team), regiments together, squadrons
+    /// together.
+    const fn drags_with(self, other: Self) -> bool {
+        matches!(
+            (self, other),
+            (
+                Self::Character(_) | Self::SpecialForce(_),
+                Self::Character(_) | Self::SpecialForce(_)
+            ) | (Self::Troop(_), Self::Troop(_))
+                | (Self::Squadron { .. }, Self::Squadron { .. })
+        )
+    }
+
     /// The object its pop-up menu opens for: a character (`FUN_004ed350`),
     /// a special force (`FUN_00503b50`), a regiment (`FUN_00504b30`) or a
     /// defense facility, whose menu holds Encyclopedia and Status
@@ -214,9 +238,8 @@ struct OpenDefensesWindow {
     system: SystemKey,
     logical_position: (i16, i16),
     page: DefensesPage,
-    /// port: one selected row; the list's own selection rules
-    /// (`FUN_00609410`) are untraced.
-    selected: Option<DefensesItem>,
+    /// The list's selection (`CoolDragList`, [`ListSelection`]).
+    selection: ListSelection<DefensesItem>,
     /// The list's first shown row of three cells, and its scroll bar's
     /// press (`FUN_0060a490`, RCDATA `0x29cc`).
     first_row: usize,
@@ -255,10 +278,14 @@ impl PreparedDefensesWindow {
 
 /// A left press held on a squadron, character or special-force row until
 /// its release (`CoolDragList`, `FUN_006083c0`).
-#[derive(Debug, Clone, Copy, PartialEq)]
+#[derive(Debug, Clone, PartialEq)]
 struct RowDrag {
     system: SystemKey,
+    /// The pressed row, whose mini the drag image shows.
     item: DefensesItem,
+    /// Every row the drop moves: the pressed one with the selection of its
+    /// kind ([`ListSelection::dragged`]).
+    items: Vec<DefensesItem>,
     is_alliance: bool,
     press: egui::Pos2,
     list: egui::Rect,
@@ -396,7 +423,7 @@ impl DefensesWindowState {
                     system: prepared.system,
                     logical_position: prepared.logical_position,
                     page: DefensesPage::Personnel,
-                    selected: None,
+                    selection: ListSelection::default(),
                     first_row: 0,
                     scroll: ScrollDrag::default(),
                     release_target_visible: false,
@@ -450,7 +477,7 @@ impl DefensesWindowState {
                 DEFENSES_WINDOW_HEIGHT,
             ),
             page: DefensesPage::Personnel,
-            selected: None,
+            selection: ListSelection::default(),
             first_row: 0,
             scroll: ScrollDrag::default(),
             release_target_visible: true,
@@ -636,7 +663,7 @@ impl DefensesWindowState {
         };
         if window.page != page {
             window.page = page;
-            window.selected = None;
+            window.selection.clear();
             window.first_row = 0;
         }
         true
@@ -695,8 +722,10 @@ impl DefensesWindowState {
             window.page,
         );
         let selected = window
-            .selected
-            .and_then(|item| rows.iter().position(|row| row.item == item));
+            .selection
+            .items()
+            .first()
+            .and_then(|&item| rows.iter().position(|row| row.item == item));
         Some(DefensesWindowReport {
             origin: window.logical_position,
             side: shown_side(world, system),
@@ -801,7 +830,7 @@ impl DefensesWindowState {
     /// The held drag's image, which follows the pointer ([`DragImage`]).
     #[must_use]
     pub fn drag_image(&self) -> Option<DragImage> {
-        self.drag.map(|drag| drag.image)
+        self.drag.as_ref().map(|drag| drag.image)
     }
 
     /// Exact manager capture owner of the active Defenses drag, if migrated.
@@ -819,6 +848,7 @@ impl DefensesWindowState {
         self.drag = Some(RowDrag {
             system: SystemKey::default(),
             item: DefensesItem::Character(CharacterKey::default()),
+            items: vec![DefensesItem::Character(CharacterKey::default())],
             is_alliance: true,
             press: egui::Pos2::ZERO,
             list: egui::Rect::from_min_max(egui::Pos2::ZERO, egui::pos2(1.0, 1.0)),
@@ -895,25 +925,46 @@ impl DefensesWindowState {
             return result;
         }
         let action = match drag.item {
-            DefensesItem::Squadron { class, .. } => DefensesWindowAction::DragSquadron {
+            DefensesItem::Squadron { .. } => DefensesWindowAction::DragSquadrons {
                 system: drag.system,
-                class,
+                classes: drag
+                    .items
+                    .iter()
+                    .filter_map(|item| match *item {
+                        DefensesItem::Squadron { class, .. } => Some(class),
+                        _ => None,
+                    })
+                    .collect(),
                 is_alliance: drag.is_alliance,
                 confirmed: ctrl,
                 point,
             },
-            DefensesItem::Character(key) => DefensesWindowAction::DragMember {
-                member: MissionMember::Character(key),
-                confirmed: ctrl,
-                point,
-            },
-            DefensesItem::SpecialForce(key) => DefensesWindowAction::DragMember {
-                member: MissionMember::SpecialForce(key),
-                confirmed: ctrl,
-                point,
-            },
-            DefensesItem::Troop(troop) => DefensesWindowAction::DragRegiment {
-                troop,
+            DefensesItem::Character(_) | DefensesItem::SpecialForce(_) => {
+                DefensesWindowAction::DragMembers {
+                    members: drag
+                        .items
+                        .iter()
+                        .filter_map(|item| match *item {
+                            DefensesItem::Character(key) => Some(MissionMember::Character(key)),
+                            DefensesItem::SpecialForce(key) => {
+                                Some(MissionMember::SpecialForce(key))
+                            }
+                            _ => None,
+                        })
+                        .collect(),
+                    confirmed: ctrl,
+                    point,
+                }
+            }
+            DefensesItem::Troop(_) => DefensesWindowAction::DragRegiments {
+                troops: drag
+                    .items
+                    .iter()
+                    .filter_map(|item| match *item {
+                        DefensesItem::Troop(troop) => Some(troop),
+                        _ => None,
+                    })
+                    .collect(),
                 confirmed: ctrl,
                 point,
             },
@@ -980,7 +1031,7 @@ impl DefensesWindowState {
             system,
             logical_position: saved.position,
             page: DefensesPage::Personnel,
-            selected: None,
+            selection: ListSelection::default(),
             first_row: 0,
             scroll: ScrollDrag::default(),
             release_target_visible: true,
@@ -1067,7 +1118,7 @@ pub struct DefensesWindowReport {
 }
 
 /// Actions that leave the Defenses window manager.
-#[derive(Debug, Clone, Copy, PartialEq)]
+#[derive(Debug, Clone, PartialEq)]
 pub enum DefensesWindowAction {
     /// The sector button (`0xca`) opens the subject's sector window
     /// (`FUN_00429ce0`).
@@ -1101,14 +1152,18 @@ pub enum DefensesWindowAction {
         owner: Option<WindowId>,
         system: SystemKey,
         selection: Option<MenuObject>,
+        /// Every selected object the menu's orders take as their team
+        /// (`FUN_00487c50`); `selection` alone when only it is selected.
+        team: Vec<MenuObject>,
         point: (i16, i16),
     },
     /// A Squadrons page row dragged out of the list (`0x29a`): the galaxy
     /// view hit-tests the screen point and issues `0x201`, or `0x202` with
     /// Ctrl (`TroopTransportState::move_squadron`).
-    DragSquadron {
+    DragSquadrons {
         system: SystemKey,
-        class: FighterKey,
+        /// One entry per dragged squadron, by class.
+        classes: Vec<FighterKey>,
         is_alliance: bool,
         confirmed: bool,
         point: egui::Pos2,
@@ -1118,16 +1173,16 @@ pub enum DefensesWindowAction {
     /// the regiment boards a fleet, lands or travels
     /// (`TroopTransportState::move_regiment`; fleet-window.md, "From the
     /// Fleet window or type 10").
-    DragRegiment {
-        troop: TroopKey,
+    DragRegiments {
+        troops: Vec<TroopKey>,
         confirmed: bool,
         point: egui::Pos2,
     },
     /// A Personnel page row dragged out of the list: the galaxy view
     /// issues `0x201`, or `0x202` with Ctrl, and the character or special
     /// force goes on a Move mission (`0x241`).
-    DragMember {
-        member: MissionMember,
+    DragMembers {
+        members: Vec<MissionMember>,
         confirmed: bool,
         point: egui::Pos2,
     },
@@ -1386,12 +1441,17 @@ struct WindowDrawResult {
     minimize: bool,
     open_sector: bool,
     page: Option<DefensesPage>,
-    select: Option<DefensesItem>,
-    /// A press on the list's empty space clears the selection
-    /// (`FUN_006094b0`).
-    deselect: bool,
-    /// The selection and canvas point of a right release on the list.
-    object_menu: Option<(Option<MenuObject>, (i16, i16))>,
+    /// A press on the `n`th row of the page, and the keys held.
+    press: Option<(usize, Modifiers)>,
+    /// The release that ends a press on the `n`th row with no drag.
+    release: Option<(usize, Modifiers)>,
+    /// A press on the list's empty space (`FUN_006094b0` without Ctrl).
+    deselect: Option<Modifiers>,
+    /// The page's rows, for the selection's box (`FUN_00609590`).
+    rows: Vec<DefensesItem>,
+    /// The pressed object, the selection it opens for, and the canvas
+    /// point of a right release on the list.
+    object_menu: Option<(Option<MenuObject>, Vec<MenuObject>, (i16, i16))>,
     drag: Option<RowDrag>,
     /// The list's first row and bar press after this frame.
     scroll: Option<(usize, ScrollDrag)>,
@@ -1637,8 +1697,9 @@ fn draw_defenses_windows_with_snapshot(
             || result.minimize
             || result.open_sector
             || result.page.is_some()
-            || result.select.is_some()
-            || result.deselect
+            || result.press.is_some()
+            || result.release.is_some()
+            || result.deselect.is_some()
             || result.object_menu.is_some()
             || result.drag.is_some()
             || scroll_changed;
@@ -1703,14 +1764,20 @@ fn draw_defenses_windows_with_snapshot(
             // hyp: a refill shows the new page from its top.
             if let Some(page) = result.page.filter(|&page| page != open.page) {
                 open.page = page;
-                open.selected = None;
+                open.selection.clear();
                 open.first_row = 0;
-            }
-            if result.deselect {
-                open.selected = None;
-            }
-            if let Some(item) = result.select {
-                open.selected = Some(item);
+            } else {
+                let rows = &result.rows;
+                open.selection.retain(|item| rows.contains(&item));
+                if let Some(modifiers) = result.deselect {
+                    open.selection.press_empty(modifiers);
+                }
+                if let Some((index, modifiers)) = result.press {
+                    open.selection.press(rows, COLUMNS, index, modifiers);
+                }
+                if let Some((index, modifiers)) = result.release {
+                    open.selection.release(rows, COLUMNS, index, modifiers);
+                }
             }
         }
         if result.focus && pointer_permitted {
@@ -1722,11 +1789,12 @@ fn draw_defenses_windows_with_snapshot(
             actions.push(DefensesWindowAction::SelectSystem(system));
         }
         if pointer_permitted {
-            if let Some((selection, point)) = result.object_menu {
+            if let Some((selection, team, point)) = result.object_menu {
                 actions.push(DefensesWindowAction::OpenObjectMenu {
                     owner: window.id,
                     system,
                     selection,
+                    team,
                     point,
                 });
             }
@@ -1960,9 +2028,13 @@ fn draw_defenses_window(
                     input.pointer.interact_pos(),
                 )
             });
+            let modifiers = ctx.input(|input| Modifiers {
+                ctrl: input.modifiers.ctrl || input.modifiers.command,
+                shift: input.modifiers.shift,
+            });
             let any_pressed = primary_pressed || right_pressed;
             if any_pressed && list_response.is_pointer_button_down_on() && !on_bar {
-                result.deselect = true;
+                result.deselect = Some(modifiers);
                 result.focus = true;
                 result.note_pointer_phase(PointerPhase::Press(if right_pressed {
                     PointerButtonId::Secondary
@@ -1972,7 +2044,7 @@ fn draw_defenses_window(
             }
             if list_response.secondary_clicked() {
                 if let Some(point) = release_point.filter(|point| rect_contains(list, *point)) {
-                    result.object_menu = Some((None, canvas_point(layout, point)));
+                    result.object_menu = Some((None, Vec::new(), canvas_point(layout, point)));
                     result.note_pointer_phase(PointerPhase::Release(PointerButtonId::Secondary));
                 }
             }
@@ -1988,6 +2060,7 @@ fn draw_defenses_window(
                 .skip(first_row * COLUMNS)
                 .take(COLUMNS * VISIBLE_ROWS);
             result.painted = shown.clone().map(|(_, row)| row.item).collect();
+            result.rows = rows.iter().map(|row| row.item).collect();
             for (cell_index, (index, row)) in shown.enumerate() {
                 let cell = cell_rect(local, scale, cell_index);
                 if let (DefensesItem::Character(key), true) =
@@ -2001,7 +2074,7 @@ fn draw_defenses_window(
                         );
                     }
                 }
-                let selected = window.selected == Some(row.item);
+                let selected = window.selection.contains(row.item);
                 // The list image (`FUN_004a9ab0` -> `FUN_0042c3b0(.., 0, 1)`):
                 // the backdrop, a member's en route mark, then the mini.
                 let (object, en_route) = match row.item {
@@ -2079,8 +2152,15 @@ fn draw_defenses_window(
                     ui.id().with((window.system, "row", index)),
                     egui::Sense::click(),
                 );
+                // FUN_006083c0: a left or right press applies the list's
+                // selection rules ([`ListSelection`]); a left release with
+                // no drag settles a press on a selected row.
+                if primary_pressed && response.is_pointer_button_down_on() {
+                    result.press = Some((index, modifiers));
+                    result.note_pointer_phase(PointerPhase::Press(PointerButtonId::Primary));
+                }
                 if exact_clicked(&response, cell) {
-                    result.select = Some(row.item);
+                    result.release = Some((index, modifiers));
                     result.focus = true;
                     result.note_pointer_phase(PointerPhase::Release(PointerButtonId::Primary));
                 }
@@ -2088,7 +2168,7 @@ fn draw_defenses_window(
                 // (FUN_006083c0 shares the WM_LBUTTONDOWN path); the release
                 // opens its menu.
                 if right_pressed && response.is_pointer_button_down_on() {
-                    result.select = Some(row.item);
+                    result.press = Some((index, modifiers));
                     result.focus = true;
                     result.note_pointer_phase(PointerPhase::Press(PointerButtonId::Secondary));
                 }
@@ -2114,9 +2194,18 @@ fn draw_defenses_window(
                     }),
                 ) {
                     if response.is_pointer_button_down_on() && rect_contains(cell, press) {
+                        // Every selected row of the pressed row's kind goes
+                        // with it (case 0x29a takes the list's selection).
+                        let items = window
+                            .selection
+                            .dragged(row.item, modifiers)
+                            .into_iter()
+                            .filter(|&item| item.drags_with(row.item))
+                            .collect();
                         result.drag = Some(RowDrag {
                             system: window.system,
                             item: row.item,
+                            items,
                             is_alliance: side == 1,
                             press,
                             list,
@@ -2132,7 +2221,20 @@ fn draw_defenses_window(
                             .interact_pointer_pos()
                             .filter(|point| rect_contains(cell.intersect(list), *point)),
                     ) {
-                        result.object_menu = Some((Some(object), canvas_point(layout, point)));
+                        // The menu's orders take the selection as their team
+                        // when the pressed row is in it.
+                        let team = if window.selection.contains(row.item) {
+                            window
+                                .selection
+                                .items()
+                                .iter()
+                                .filter_map(|item| item.menu_object(window.system, side))
+                                .collect()
+                        } else {
+                            vec![object]
+                        };
+                        result.object_menu =
+                            Some((Some(object), team, canvas_point(layout, point)));
                         result
                             .note_pointer_phase(PointerPhase::Release(PointerButtonId::Secondary));
                     }
@@ -2527,7 +2629,7 @@ mod tests {
         let selected = DefensesItem::Defense(world.systems[system].defense_facilities[0]);
         let content = state.window_mut(system).unwrap();
         content.page = DefensesPage::Batteries;
-        content.selected = Some(selected);
+        content.selection = ListSelection::only(selected);
         content.first_row = 1;
 
         let reopened = state
@@ -2550,7 +2652,7 @@ mod tests {
         let content = state.window_mut(system).unwrap();
         assert_eq!(content.logical_position, ORIGIN);
         assert_eq!(content.page, DefensesPage::Batteries);
-        assert_eq!(content.selected, Some(selected));
+        assert_eq!(content.selected(), Some(selected));
         assert_eq!(content.first_row, 1);
 
         manager.apply(WindowCommand::Minimize(id)).unwrap();
@@ -2575,7 +2677,7 @@ mod tests {
         let content = state.window_mut(system).unwrap();
         assert_eq!(content.logical_position, ORIGIN);
         assert_eq!(content.page, DefensesPage::Batteries);
-        assert_eq!(content.selected, Some(selected));
+        assert_eq!(content.selected(), Some(selected));
         assert_eq!(content.first_row, 1);
     }
 
@@ -2589,7 +2691,7 @@ mod tests {
         let selected = DefensesItem::Defense(world.systems[system].defense_facilities[0]);
         let content = state.window_mut(system).unwrap();
         content.page = DefensesPage::Batteries;
-        content.selected = Some(selected);
+        content.selection = ListSelection::only(selected);
         content.first_row = 1;
 
         let prepared = state
@@ -2617,7 +2719,7 @@ mod tests {
         let content = state.window_mut(system).unwrap();
         assert_eq!(content.logical_position, ORIGIN);
         assert_eq!(content.page, DefensesPage::Batteries);
-        assert_eq!(content.selected, Some(selected));
+        assert_eq!(content.selected(), Some(selected));
         assert_eq!(content.first_row, 1);
     }
 
@@ -3238,7 +3340,7 @@ mod tests {
         // The same tab keeps the selection; another clears it.
         let _ = run(&world, &missions, &mut state, click(at(40.0, 30.0)));
         assert_eq!(
-            state.windows[0].selected,
+            state.windows[0].selected(),
             Some(DefensesItem::Character(
                 world
                     .characters
@@ -3250,7 +3352,7 @@ mod tests {
         );
         let regiments = run(&world, &missions, &mut state, click(at(80.0, 30.0)));
         assert_eq!(state.windows[0].page, DefensesPage::Regiments);
-        assert_eq!(state.windows[0].selected, None);
+        assert_eq!(state.windows[0].selected(), None);
         // The regiment page of the player's own system shows the garrison.
         // `+0x5c` at (2, 63), 228 by 17: centred both ways.
         let garrison = text(&regiments, "Garrison Requirement: 2");
@@ -3357,16 +3459,14 @@ mod tests {
                 let drops: Vec<_> = released
                     .actions
                     .iter()
-                    .filter_map(|action| match *action {
-                        DefensesWindowAction::DragSquadron {
-                            class: dropped,
-                            confirmed,
-                            ..
-                        } => Some((dropped, confirmed)),
+                    .filter_map(|action| match action {
+                        DefensesWindowAction::DragSquadrons {
+                            classes, confirmed, ..
+                        } => Some((classes.clone(), *confirmed)),
                         _ => None,
                     })
                     .collect();
-                assert_eq!(drops, [(class, confirmed)], "{faction:?}");
+                assert_eq!(drops, [(vec![class], confirmed)], "{faction:?}");
             }
         }
     }
@@ -3488,16 +3588,14 @@ mod tests {
                 let drops: Vec<_> = released
                     .actions
                     .iter()
-                    .filter_map(|action| match *action {
-                        DefensesWindowAction::DragRegiment {
-                            troop: dropped,
-                            confirmed,
-                            ..
-                        } => Some((dropped, confirmed)),
+                    .filter_map(|action| match action {
+                        DefensesWindowAction::DragRegiments {
+                            troops, confirmed, ..
+                        } => Some((troops.clone(), *confirmed)),
                         _ => None,
                     })
                     .collect();
-                assert_eq!(drops, [(troop, confirmed)], "{faction:?}");
+                assert_eq!(drops, [(vec![troop], confirmed)], "{faction:?}");
             }
         }
     }
@@ -3548,7 +3646,7 @@ mod tests {
                 )
                 .actions
                 .iter()
-                .filter(|action| matches!(action, DefensesWindowAction::DragSquadron { .. }))
+                .filter(|action| matches!(action, DefensesWindowAction::DragSquadrons { .. }))
                 .count()
             };
 
@@ -3610,13 +3708,72 @@ mod tests {
 
         let opened = run(&world, &missions, &mut state, right_click(at(100.0, 100.0)));
         assert_eq!(
-            state.windows[0].selected,
+            state.windows[0].selected(),
             Some(DefensesItem::Character(hidden))
         );
         assert_eq!(
             menus(&opened),
             [(Some(MenuObject::Character(hidden)), (120, 130))]
         );
+    }
+
+    /// `CoolDragList` (`FUN_006083c0`): Ctrl adds a row to the selection,
+    /// a drag from a selected row carries the whole selection as one team
+    /// (`0x29a` takes the list's selection), and the pop-up menu's orders
+    /// take it as their team (`FUN_004a7a20`, `FUN_00487c50`), for either
+    /// side.
+    #[test]
+    fn ctrl_selects_several_agents_that_drag_and_take_orders_as_one_team() {
+        let (mut world, system, missions) = stocked();
+        for faction in [CockpitFaction::Alliance, CockpitFaction::Empire] {
+            let alliance = faction == CockpitFaction::Alliance;
+            for character in world.characters.values_mut() {
+                character.is_alliance = character.is_alliance == alliance;
+                character.is_empire = !character.is_alliance;
+            }
+            let mut state = DefensesWindowState::default();
+            assert!(state.open(&world, system, ORIGIN, faction, scaled()));
+            let plain = (faction, egui::Modifiers::default());
+            let ctrl = (faction, egui::Modifiers::CTRL);
+            let (first, second) = (at(40.0, 100.0), at(110.0, 100.0));
+            let _ = run_as(&world, &missions, &mut state, click(first), plain);
+            let _ = run_as(&world, &missions, &mut state, click(second), ctrl);
+            let team = state.windows[0].selection.items().to_vec();
+            assert_eq!(team.len(), 2, "{faction:?}: {team:?}");
+
+            let end = at(300.0, 100.0);
+            let mut frames = hover(second);
+            frames.extend([vec![press(second, true)], vec![egui::Event::PointerMoved(end)]]);
+            let _ = run_as(&world, &missions, &mut state, frames, plain);
+            let released = run_as(
+                &world,
+                &missions,
+                &mut state,
+                vec![vec![egui::Event::PointerMoved(end), press(end, false)]],
+                plain,
+            );
+            let dropped: Vec<_> = released
+                .actions
+                .iter()
+                .filter_map(|action| match action {
+                    DefensesWindowAction::DragMembers { members, .. } => Some(members.len()),
+                    _ => None,
+                })
+                .collect();
+            assert_eq!(dropped, [2], "{faction:?}: one drop moves both");
+            assert_eq!(state.windows[0].selection.items(), team);
+
+            let opened = run_as(&world, &missions, &mut state, right_click(first), plain);
+            let teams: Vec<_> = opened
+                .actions
+                .iter()
+                .filter_map(|action| match action {
+                    DefensesWindowAction::OpenObjectMenu { team, .. } => Some(team.len()),
+                    _ => None,
+                })
+                .collect();
+            assert_eq!(teams, [2], "{faction:?}: the menu takes the team");
+        }
     }
 
     #[test]
@@ -3674,7 +3831,7 @@ mod tests {
         let _ = run(&world, &missions, &mut state, click(at(150.0, 30.0)));
         assert_eq!(state.windows[0].page, DefensesPage::Shields);
         let opened = run(&world, &missions, &mut state, right_click(at(30.0, 100.0)));
-        let Some(DefensesItem::Defense(shield)) = state.windows[0].selected else {
+        let Some(DefensesItem::Defense(shield)) = state.windows[0].selected() else {
             panic!("the right press selects the shield");
         };
         assert_eq!(
@@ -3691,10 +3848,10 @@ mod tests {
         let (world, system, missions) = stocked();
         let mut state = opened(&world, system);
         let _ = run(&world, &missions, &mut state, click(at(100.0, 100.0)));
-        assert!(state.windows[0].selected.is_some());
+        assert!(state.windows[0].selected().is_some());
 
         let empty = run(&world, &missions, &mut state, right_click(at(100.0, 250.0)));
-        assert_eq!(state.windows[0].selected, None);
+        assert_eq!(state.windows[0].selected(), None);
         assert_eq!(menus(&empty), [(None, (120, 280))]);
 
         // Above the list, a right click opens nothing.
@@ -3739,7 +3896,7 @@ mod tests {
             .unwrap()
             .0;
         assert_eq!(
-            state.windows[0].selected,
+            state.windows[0].selected(),
             Some(DefensesItem::Character(hidden)),
             "a routed secondary press selects before its later menu release"
         );
@@ -3760,7 +3917,7 @@ mod tests {
             ],
         );
         assert_eq!(
-            state.windows[0].selected, None,
+            state.windows[0].selected(), None,
             "the same routed secondary press clears empty list space"
         );
     }
@@ -3818,10 +3975,10 @@ mod tests {
         let mut state = opened(&world, system);
         let _ = run(&world, &missions, &mut state, click(at(100.0, 100.0)));
         assert!(state.show_page(system, DefensesPage::Personnel));
-        assert!(state.windows[0].selected.is_some());
+        assert!(state.windows[0].selected().is_some());
         assert!(state.show_page(system, DefensesPage::Regiments));
         assert_eq!(state.windows[0].page, DefensesPage::Regiments);
-        assert_eq!(state.windows[0].selected, None);
+        assert_eq!(state.windows[0].selected(), None);
 
         let mut other = world.clone();
         let missing = other.systems.insert(world.systems[system].clone());

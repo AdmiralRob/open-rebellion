@@ -45,10 +45,14 @@ pub enum TargetOrder {
         members: Vec<MissionMember>,
         confirmed: bool,
     },
-    /// A regiment's Move (`0x201`) or Confirmed Move (`0x202`). Released on
-    /// a Fleet window it boards the fleet (`ghidra/notes/fleet-window.md`,
+    /// Regiments' Move (`0x201`) or Confirmed Move (`0x202`): one, or a
+    /// list's selection of them as the order's team. Released on a Fleet
+    /// window they board the fleet (`ghidra/notes/fleet-window.md`,
     /// "Loading a regiment onto a fleet").
-    TroopMove { troop: TroopKey, confirmed: bool },
+    TroopMove {
+        troops: Vec<TroopKey>,
+        confirmed: bool,
+    },
     /// A squadron's Move (`0x201`, `FUN_00503930`) or Confirmed Move
     /// (`0x202`): it takes the regiment's path, boarding a fleet, landing
     /// or travelling alone (`TroopTransportState::move_squadron`).

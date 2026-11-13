@@ -697,6 +697,9 @@ impl CommandGates {
 #[derive(Debug, Clone, PartialEq)]
 pub struct ObjectMenuState {
     selection: Option<MenuObject>,
+    /// Every selected object the orders take as their team
+    /// (`FUN_00487c50`): `selection` alone unless a list selected more.
+    team: Vec<MenuObject>,
     rows: Vec<ObjectMenuRow>,
     /// Each row's submenu rows, empty for a row that has none.
     submenus: Vec<Vec<ObjectMenuRow>>,
@@ -715,10 +718,37 @@ impl ObjectMenuState {
             .collect();
         Self {
             selection,
+            team: selection.into_iter().collect(),
             rows,
             submenus,
             point: (f32::from(point.0), f32::from(point.1)),
         }
+    }
+
+    /// The menu for a list's selection of several objects: the orders take
+    /// all of them as their team. A Command order refuses a team of more
+    /// than one (`FUN_00580db0`, status `0x15`), so its rows are disabled.
+    #[must_use]
+    pub fn for_team(
+        selection: Option<MenuObject>,
+        team: Vec<MenuObject>,
+        mut gates: OrderGates,
+        point: (i16, i16),
+    ) -> Self {
+        if team.len() > 1 {
+            gates.command.allowed = [false; 4];
+        }
+        let mut menu = Self::new(selection, gates, point);
+        if !team.is_empty() {
+            menu.team = team;
+        }
+        menu
+    }
+
+    /// The objects the menu's orders act on.
+    #[must_use]
+    pub fn team(&self) -> &[MenuObject] {
+        &self.team
     }
 
     #[must_use]
@@ -1765,6 +1795,32 @@ mod tests {
         assert_eq!(checked(CommandKind::Admiral), ["Admiral"]);
         assert_eq!(checked(CommandKind::General), ["General"]);
         assert!(checked(CommandKind::None).is_empty());
+    }
+
+    /// `FUN_00580db0` refuses a Command order for a team of more than one
+    /// (status `0x15`); the team is what the orders act on (`FUN_00487c50`).
+    #[test]
+    fn a_menu_for_several_characters_keeps_the_team_and_disables_command() {
+        use rebellion_core::ids::SpecialForceKey;
+        let first = MenuObject::Character(CharacterKey::default());
+        let second = MenuObject::SpecialForce(SpecialForceKey::default());
+        let gates = OrderGates {
+            command: CommandGates {
+                allowed: [true; 4],
+                held: CommandKind::None,
+            },
+            ..OrderGates::default()
+        };
+        let command_enabled = |menu: &ObjectMenuState| {
+            let row = menu.row_of(ObjectMenuCommand::Command).unwrap();
+            menu.rows[row].enabled
+        };
+        let alone = ObjectMenuState::for_team(Some(first), vec![first], gates, (0, 0));
+        assert_eq!(alone.team(), [first]);
+        assert!(command_enabled(&alone));
+        let team = ObjectMenuState::for_team(Some(first), vec![first, second], gates, (0, 0));
+        assert_eq!(team.team(), [first, second]);
+        assert!(!command_enabled(&team));
     }
 
     #[test]

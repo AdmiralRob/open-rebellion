@@ -16657,6 +16657,7 @@ async fn main() {
                             DefensesWindowAction::OpenObjectMenu {
                                 owner,
                                 selection,
+                                team,
                                 point,
                                 ..
                             } => {
@@ -16676,7 +16677,7 @@ async fn main() {
                                     strategic_windowing.enqueue(prepared.command());
                                     pending_object_menu_publications.push((
                                         prepared,
-                                        ObjectMenuState::new(selection, gates, point),
+                                        ObjectMenuState::for_team(selection, team, gates, point),
                                         capture_indexed_status_menu_witness(&world, selection),
                                     ));
                                     strategic_dispatch_restricted = true;
@@ -16684,9 +16685,10 @@ async fn main() {
                             }
                             // FUN_00422ce0: the drop issues 0x201 (0x202 with
                             // Ctrl) against the window under the point, and
-                            // FUN_0053c4b0 makes it a 0x241 Move mission.
-                            DefensesWindowAction::DragMember {
-                                member,
+                            // FUN_0053c4b0 makes it a 0x241 Move mission for
+                            // the list's selection.
+                            DefensesWindowAction::DragMembers {
+                                members,
                                 confirmed,
                                 point,
                             } => {
@@ -16716,7 +16718,7 @@ async fn main() {
                                         faction: player_faction,
                                     },
                                     &mission_state,
-                                    vec![member],
+                                    members,
                                     confirmed,
                                     target,
                                     &mut advisor_state,
@@ -16729,8 +16731,8 @@ async fn main() {
                             }
                             // A Troops page drop: 0x201 or, with Ctrl, 0x202
                             // against the release window (FUN_00422ce0).
-                            DefensesWindowAction::DragRegiment {
-                                troop,
+                            DefensesWindowAction::DragRegiments {
+                                troops,
                                 confirmed,
                                 point,
                             } => {
@@ -16752,7 +16754,7 @@ async fn main() {
                                 ) else {
                                     continue;
                                 };
-                                if issue_unit_move(
+                                if issue_units_move(
                                     &FleetMoveContext {
                                         world: &world,
                                         movement: &movement_state,
@@ -16761,7 +16763,7 @@ async fn main() {
                                     },
                                     &troop_transport_state,
                                     &ProductRoom::new(&mfg_state, &delivery_state),
-                                    UnitMover::Regiment(troop),
+                                    troops.into_iter().map(UnitMover::Regiment).collect(),
                                     confirmed,
                                     target,
                                     &mut move_confirmation_state,
@@ -16771,9 +16773,9 @@ async fn main() {
                                     strategic_dispatch_restricted = true;
                                 }
                             }
-                            DefensesWindowAction::DragSquadron {
+                            DefensesWindowAction::DragSquadrons {
                                 system,
-                                class,
+                                classes,
                                 is_alliance,
                                 confirmed,
                                 point,
@@ -16796,7 +16798,7 @@ async fn main() {
                                 ) else {
                                     continue;
                                 };
-                                if issue_unit_move(
+                                if issue_units_move(
                                     &FleetMoveContext {
                                         world: &world,
                                         movement: &movement_state,
@@ -16805,11 +16807,16 @@ async fn main() {
                                     },
                                     &troop_transport_state,
                                     &ProductRoom::new(&mfg_state, &delivery_state),
-                                    UnitMover::Squadron(SquadronSource::System {
-                                        system,
-                                        class,
-                                        is_alliance,
-                                    }),
+                                    classes
+                                        .into_iter()
+                                        .map(|class| {
+                                            UnitMover::Squadron(SquadronSource::System {
+                                                system,
+                                                class,
+                                                is_alliance,
+                                            })
+                                        })
+                                        .collect(),
                                     confirmed,
                                     target,
                                     &mut move_confirmation_state,
@@ -16944,6 +16951,22 @@ async fn main() {
                             Some(choice)
                         }
                     };
+                    // The orders' team: the list selection the menu opened
+                    // for (FUN_00487c50).
+                    let menu_team: Vec<MenuObject> = object_menu
+                        .as_ref()
+                        .map(|menu| menu.team().to_vec())
+                        .unwrap_or_default();
+                    let team_members = |object: MenuObject| -> Vec<MissionMember> {
+                        if menu_team.len() > 1 {
+                            menu_team
+                                .iter()
+                                .filter_map(|member| member.mission_member())
+                                .collect()
+                        } else {
+                            object.mission_member().into_iter().collect()
+                        }
+                    };
                     match object_menu_choice {
                         Some((ObjectMenuCommand::Encyclopedia, selection)) => {
                             if let Some(session) = encyclopedia_session_store.current() {
@@ -17024,9 +17047,9 @@ async fn main() {
                         // FUN_00487c50 builds the order with the selection
                         // as its team; FUN_00429320 starts targeting.
                         Some((ObjectMenuCommand::Mission, Some(object))) => {
-                            if let Some(member) = object.mission_member() {
-                                targeting =
-                                    Some(Targeting::new(TargetOrder::Mission(vec![member])));
+                            let team = team_members(object);
+                            if !team.is_empty() {
+                                targeting = Some(Targeting::new(TargetOrder::Mission(team)));
                                 strategic_dispatch_restricted = true;
                             }
                         }
@@ -17067,9 +17090,10 @@ async fn main() {
                             command @ (ObjectMenuCommand::Move | ObjectMenuCommand::ConfirmedMove),
                             Some(object @ (MenuObject::Character(_) | MenuObject::SpecialForce(_))),
                         )) => {
-                            if let Some(member) = object.mission_member() {
+                            let members = team_members(object);
+                            if !members.is_empty() {
                                 targeting = Some(Targeting::new(TargetOrder::MemberMove {
-                                    members: vec![member],
+                                    members,
                                     confirmed: command == ObjectMenuCommand::ConfirmedMove,
                                 }));
                             }
@@ -17078,8 +17102,18 @@ async fn main() {
                             command @ (ObjectMenuCommand::Move | ObjectMenuCommand::ConfirmedMove),
                             Some(MenuObject::Troop(troop)),
                         )) => {
+                            let mut troops: Vec<_> = menu_team
+                                .iter()
+                                .filter_map(|object| match *object {
+                                    MenuObject::Troop(key) => Some(key),
+                                    _ => None,
+                                })
+                                .collect();
+                            if troops.is_empty() {
+                                troops.push(troop);
+                            }
                             targeting = Some(Targeting::new(TargetOrder::TroopMove {
-                                troop,
+                                troops,
                                 confirmed: command == ObjectMenuCommand::ConfirmedMove,
                             }));
                             strategic_dispatch_restricted = true;
@@ -17669,16 +17703,17 @@ async fn main() {
                                         | TargetOrder::SquadronMove { .. }),
                                     target,
                                 }) => {
-                                    let (unit, confirmed) = match order {
-                                        TargetOrder::TroopMove { troop, confirmed } => {
-                                            (UnitMover::Regiment(troop), confirmed)
-                                        }
+                                    let (units, confirmed) = match order {
+                                        TargetOrder::TroopMove { troops, confirmed } => (
+                                            troops.into_iter().map(UnitMover::Regiment).collect(),
+                                            confirmed,
+                                        ),
                                         TargetOrder::SquadronMove { source, confirmed } => {
-                                            (UnitMover::Squadron(source), confirmed)
+                                            (vec![UnitMover::Squadron(source)], confirmed)
                                         }
                                         _ => unreachable!("matched a unit order"),
                                     };
-                                    if issue_unit_move(
+                                    if issue_units_move(
                                         &FleetMoveContext {
                                             world: &world,
                                             movement: &movement_state,
@@ -17687,7 +17722,7 @@ async fn main() {
                                         },
                                         &troop_transport_state,
                                         &ProductRoom::new(&mfg_state, &delivery_state),
-                                        unit,
+                                        units,
                                         confirmed,
                                         target,
                                         &mut move_confirmation_state,
@@ -21626,6 +21661,40 @@ fn issue_unit_move(
     strategic_windowing: &mut StrategicWindowing,
     panel_actions: &mut Vec<PanelAction>,
 ) -> bool {
+    issue_units_move(
+        context,
+        transport,
+        products,
+        vec![unit],
+        confirmed,
+        target,
+        move_confirmation_state,
+        strategic_windowing,
+        panel_actions,
+    )
+}
+
+/// [`issue_unit_move`] for a list selection's regiments or squadrons, one
+/// order with them all as its team: each unit's own move (`0x204`) is
+/// validated, any refusal refuses the order, and the one window lists every
+/// unit; the blockade warning follows the first unit's container, as
+/// `FUN_00487cc0` reads the team's first member.
+#[expect(
+    clippy::too_many_arguments,
+    clippy::too_many_lines,
+    reason = "The release hands over the order, the transport state and every window it may open."
+)]
+fn issue_units_move(
+    context: &FleetMoveContext<'_>,
+    transport: &TroopTransportState,
+    products: &ProductRoom,
+    units: Vec<UnitMover>,
+    confirmed: bool,
+    target: ReleaseTarget,
+    move_confirmation_state: &mut MoveConfirmationState,
+    strategic_windowing: &mut StrategicWindowing,
+    panel_actions: &mut Vec<PanelAction>,
+) -> bool {
     use rebellion_core::troop_transport::TroopTransportError;
     let world = context.world;
     let (destination, join) = match target {
@@ -21633,84 +21702,92 @@ fn issue_unit_move(
         ReleaseTarget::Fleet { fleet, system } => (system, Some(fleet)),
     };
     let order = join.map_or(RegimentTarget::System(destination), RegimentTarget::Fleet);
-    let (is_alliance, standing, name) = match unit {
-        UnitMover::Regiment(troop) => {
-            let value = world.troops.get(troop);
-            (
-                value.map(|value| value.is_alliance),
-                world
-                    .systems
-                    .iter()
-                    .find(|(_, system)| system.ground_units.contains(&troop))
-                    .map(|(key, _)| key),
-                value
-                    .and_then(|value| world.buildable_classes.get(&value.class_dat_id))
-                    .map(|class| class.name.clone()),
-            )
-        }
-        UnitMover::Squadron(SquadronSource::Fleet { fleet, index }) => {
-            let value = world.fleets.get(fleet);
-            let class = value
-                .and_then(|value| value.fighters.get(index))
-                .and_then(|entry| world.fighter_classes.get(entry.class));
-            (
-                value.map(|value| value.is_alliance),
-                None,
-                class.map(|class| class.name.clone()),
-            )
-        }
-        UnitMover::Squadron(SquadronSource::System {
-            system,
-            class,
-            is_alliance,
-        }) => (
-            Some(is_alliance),
-            Some(system),
-            world
-                .fighter_classes
-                .get(class)
-                .map(|class| class.name.clone()),
-        ),
-    };
     let player_is_alliance = context.faction == MissionFaction::Alliance;
-    let days = if is_alliance == Some(player_is_alliance) {
-        match unit {
-            UnitMover::Regiment(troop) => transport.regiment_move_days(
-                world,
-                context.movement,
-                context.blockaded,
-                products,
-                troop,
-                order,
-            ),
-            UnitMover::Squadron(source) => transport.squadron_move_days(
-                world,
-                context.movement,
-                context.blockaded,
-                products,
-                source,
-                order,
-            ),
-        }
-    } else {
-        Err(TroopTransportError::WrongFaction)
-    };
-    let days = match days {
-        Ok(days) => days,
-        Err(error) => {
-            macroquad::logging::info!("[order] unit move refused: {:?}", error);
-            if let Some(status) = transport_refusal_status(error) {
-                panel_actions.push(PanelAction::AdvisorRefusal(status));
+    let mut lines = Vec::new();
+    let mut first_standing = None;
+    for (index, &unit) in units.iter().enumerate() {
+        let (is_alliance, standing, name) = match unit {
+            UnitMover::Regiment(troop) => {
+                let value = world.troops.get(troop);
+                (
+                    value.map(|value| value.is_alliance),
+                    world
+                        .systems
+                        .iter()
+                        .find(|(_, system)| system.ground_units.contains(&troop))
+                        .map(|(key, _)| key),
+                    value
+                        .and_then(|value| world.buildable_classes.get(&value.class_dat_id))
+                        .map(|class| class.name.clone()),
+                )
             }
-            return false;
+            UnitMover::Squadron(SquadronSource::Fleet { fleet, index }) => {
+                let value = world.fleets.get(fleet);
+                let class = value
+                    .and_then(|value| value.fighters.get(index))
+                    .and_then(|entry| world.fighter_classes.get(entry.class));
+                (
+                    value.map(|value| value.is_alliance),
+                    None,
+                    class.map(|class| class.name.clone()),
+                )
+            }
+            UnitMover::Squadron(SquadronSource::System {
+                system,
+                class,
+                is_alliance,
+            }) => (
+                Some(is_alliance),
+                Some(system),
+                world
+                    .fighter_classes
+                    .get(class)
+                    .map(|class| class.name.clone()),
+            ),
+        };
+        let days = if is_alliance == Some(player_is_alliance) {
+            match unit {
+                UnitMover::Regiment(troop) => transport.regiment_move_days(
+                    world,
+                    context.movement,
+                    context.blockaded,
+                    products,
+                    troop,
+                    order,
+                ),
+                UnitMover::Squadron(source) => transport.squadron_move_days(
+                    world,
+                    context.movement,
+                    context.blockaded,
+                    products,
+                    source,
+                    order,
+                ),
+            }
+        } else {
+            Err(TroopTransportError::WrongFaction)
+        };
+        let days = match days {
+            Ok(days) => days,
+            Err(error) => {
+                macroquad::logging::info!("[order] unit move refused: {:?}", error);
+                if let Some(status) = transport_refusal_status(error) {
+                    panel_actions.push(PanelAction::AdvisorRefusal(status));
+                }
+                return false;
+            }
+        };
+        if index == 0 {
+            first_standing = standing;
         }
-    };
+        lines.push((name.unwrap_or_default(), days));
+    }
     let side = if player_is_alliance {
         Faction::Alliance
     } else {
         Faction::Empire
     };
-    let blockaded = standing.is_some_and(|system| {
+    let blockaded = first_standing.is_some_and(|system| {
         context.blockaded.contains(&system)
             && world
                 .systems
@@ -21718,7 +21795,7 @@ fn issue_unit_move(
                 .is_some_and(|value| value.control.is_controlled_by(side))
     });
     if !confirmed && !blockaded {
-        panel_actions.push(unit_move_action(unit, order));
+        panel_actions.extend(units.into_iter().map(|unit| unit_move_action(unit, order)));
         return false;
     }
     let confirmation = MoveConfirmation {
@@ -21726,11 +21803,11 @@ fn issue_unit_move(
         fleets: Vec::new(),
         members: Vec::new(),
         ships: None,
-        units: vec![unit],
+        units,
         destination,
         join,
         blockaded,
-        lines: vec![(name.unwrap_or_default(), days)],
+        lines,
     };
     move_confirmation_state
         .prepare_open(confirmation)
