@@ -220,6 +220,17 @@ no native test reaches, and for the WASM fixture bridges
 module can own it and test it; moving the existing action handling out is
 roadmap M2 work.
 
+Off the Mini, in a Linux container that already holds the workspace's
+`target/`, add `--in-place` and `--output <dir>`. The default copies the tree
+and builds it afresh, which a container's disk rarely holds; `--in-place`
+mutates the tree and reuses the cache, so a scoped run costs one build per
+mutant. Two of `rebellion-data`'s tests fail in a container before any mutant
+runs, both unrelated to the code under test:
+`mods::failed_config_write_preserves_the_previous_file` (root may write a
+read-only file) and the encyclopedia catalog test (it needs original data).
+`--include-ignored` therefore fails that crate's baseline until the run names
+the module under test, as in `-- --lib -- --include-ignored seeds::`.
+
 Gates cover both sides (`CLAUDE.md`, "Testing").
 
 ### Provenance Gate
