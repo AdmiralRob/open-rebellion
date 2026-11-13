@@ -62,6 +62,18 @@ const CLOSE_X: f32 = 209.0;
 /// The title label `+0x49`: from the sector button's width plus 5, 179 by
 /// 16, font 5, black, format `0x24` (left-aligned, vertically centred).
 const TITLE: (f32, f32, f32) = (19.0, 2.0, 16.0);
+/// The title well inside the window frame (STRATEGY 10297, 226 by 304):
+/// 2 points in from each side, 16 high.
+const TITLE_WELL: (f32, f32, f32, f32) = (2.0, 2.0, SYSTEM_WINDOW_WIDTH - 4.0, 16.0);
+
+/// Where the title strip may paint: the title well, in screen points. The
+/// shared strips (STRATEGY 10200..10304) are 231 wide, for the 235-wide
+/// Fleet, Defenses and Missions windows.
+fn title_strip_clip(local: egui::Rect, scale: f32) -> egui::Rect {
+    let (x, y, width, height) = TITLE_WELL;
+    logical_rect(local, scale, x, y, width, height)
+}
+
 /// The tab strip (`FUN_0060d590`) at (0, 20); each button is 36 by 33.
 const TAB_STRIP_Y: f32 = 20.0;
 const TAB_SIZE: (f32, f32) = (36.0, 33.0);
@@ -1885,10 +1897,18 @@ fn draw_system_window(
 
             painter.rect_filled(local, 0.0, egui::Color32::BLACK);
             paint(cache, DllSource::Strategy, WINDOW_BACKGROUND, 0.0, 0.0);
-            paint(
+            // The 231-wide title strip, cut to the 222 by 16 title well
+            // inside the frame of this 226-wide window (STRATEGY 10297),
+            // as the original's window surface cuts it.
+            paint_native(
+                &painter
+                    .with_clip_rect(title_strip_clip(local, scale).intersect(painter.clip_rect())),
+                ctx,
                 cache,
                 DllSource::Strategy,
                 crate::defenses_window::title_resource(side, focused),
+                local,
+                scale,
                 2.0,
                 2.0,
             );
@@ -2747,6 +2767,20 @@ fn paint_resource(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn the_title_strip_stops_inside_the_frame_past_the_close_button() {
+        let local = egui::Rect::from_min_size(
+            egui::pos2(100.0, 50.0),
+            egui::vec2(SYSTEM_WINDOW_WIDTH * 2.0, SYSTEM_WINDOW_HEIGHT * 2.0),
+        );
+        let clip = title_strip_clip(local, 2.0);
+        let close = logical_rect(local, 2.0, CLOSE_X, 3.0, 14.0, 14.0);
+        assert_eq!(clip.right(), local.right() - 4.0);
+        assert!(clip.right() >= close.right());
+        assert!(clip.right() - close.right() <= 2.0 * 2.0);
+        assert_eq!((clip.top(), clip.height()), (local.top() + 4.0, 32.0));
+    }
     use crate::cockpit::CockpitViewport;
     use crate::fleet_window::tests::PAINTED;
     use rebellion_core::dat::{ExplorationStatus, SectorGroup};
