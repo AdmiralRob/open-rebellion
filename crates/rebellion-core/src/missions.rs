@@ -127,6 +127,38 @@ pub enum MissionKind {
 }
 
 impl MissionKind {
+    /// The kind's place in the Create Mission dialog's list. `FUN_0046cab0`
+    /// keys each item (`FUN_0060ba00`, item `+0x0c`) by its record's family
+    /// `+0x2c`: Recruitment (`0x55`) 1, Jedi Training (`0x58`) 2, Subdue
+    /// Uprising (`0x57`) 3, Ship, Facility and Troop Research (`0x53` by
+    /// `+0x18` `0x20`/`0x21`/`0x22`) 4 to 6, Diplomacy (`0x51`) 7, Incite
+    /// Uprising (`0x56`) 8, Espionage (`0x52`) 9, Reconnaissance (`0x54`)
+    /// 10, Assassination (`0x63`) 11, Abduction (`0x62`) 12, Rescue (`0x61`)
+    /// 13, Death Star Sabotage (`0x6a`) 14, Sabotage (`0x69`) 15; any other
+    /// family the next value of `DAT_006a8794`. The drop-down's
+    /// `CoolDragList` orders its items by that key (`FUN_0060a890`, mode
+    /// bit 1). hyp: the box takes sort mode 1; the keys only order the list
+    /// if it does, and MISSNSD lists Diplomacy before Recruitment.
+    #[must_use]
+    pub const fn dialog_key(self) -> u16 {
+        match self {
+            MissionKind::Recruitment => 1,
+            MissionKind::SubdueUprising => 3,
+            MissionKind::Research(crate::research::TechType::Ship) => 4,
+            MissionKind::Research(crate::research::TechType::Facility) => 5,
+            MissionKind::Research(crate::research::TechType::Troop) => 6,
+            MissionKind::Diplomacy => 7,
+            MissionKind::InciteUprising => 8,
+            MissionKind::Espionage => 9,
+            MissionKind::Assassination => 11,
+            MissionKind::Abduction => 12,
+            MissionKind::Rescue => 13,
+            MissionKind::DeathStarSabotage => 14,
+            MissionKind::Sabotage => 15,
+            MissionKind::Autoscrap | MissionKind::Move => 16,
+        }
+    }
+
     /// The kind's TEXTSTRA name, as the Create Mission dialog shows it; empty
     /// for `Autoscrap`, which has none.
     #[must_use]
@@ -931,7 +963,7 @@ pub fn available_kinds(
     } else {
         TargetRules::System
     };
-    world
+    let mut kinds = world
         .mission_records
         .iter()
         .filter(|record| !record.hidden)
@@ -956,7 +988,10 @@ pub fn available_kinds(
             validate(&mission, world, uprisings, Check::Creation).is_none()
         })
         .map(|(kind, _)| kind)
-        .collect()
+        .collect::<Vec<_>>();
+    // The drop-down orders the items by their keys (`MissionKind::dialog_key`).
+    kinds.sort_by_key(|kind| kind.dialog_key());
+    kinds
 }
 
 /// Whether two present members stand at the same location, as
@@ -8368,13 +8403,16 @@ mod tests {
     }
 
     #[test]
-    fn the_dialog_lists_the_records_the_team_may_undertake_in_missnsd_order() {
-        // FUN_005422f0 walks the records in table order. Rescue names a
-        // character, so a system target leaves it out (port:).
+    fn the_dialog_lists_the_records_the_team_may_undertake_by_their_keys() {
+        // FUN_005422f0 walks the records in table order and FUN_0046cab0
+        // keys each item by family, Recruitment 1 and Diplomacy 7; the
+        // drop-down sorts by key (FUN_0060a890). MISSNSD has Diplomacy (16)
+        // before Recruitment (22). Rescue names a character, so a system
+        // target leaves it out (port:).
         let (world, here, envoy) = dialog_world(vec![
-            recruitment_record(),
-            rescue_record(),
             diplomacy_record(),
+            rescue_record(),
+            recruitment_record(),
         ]);
 
         let kinds = available_kinds(
@@ -8391,6 +8429,33 @@ mod tests {
             kinds,
             vec![MissionKind::Recruitment, MissionKind::Diplomacy]
         );
+    }
+
+    #[test]
+    fn every_dialog_key_follows_fun_0046cab0s_family_order() {
+        // FUN_0046cab0: the keys by family (mission-dialog.md, "Mission
+        // kinds"); Jedi Training (2) and Reconnaissance (10) have no
+        // port kind.
+        let order = [
+            MissionKind::Recruitment,
+            MissionKind::SubdueUprising,
+            MissionKind::Research(crate::research::TechType::Ship),
+            MissionKind::Research(crate::research::TechType::Facility),
+            MissionKind::Research(crate::research::TechType::Troop),
+            MissionKind::Diplomacy,
+            MissionKind::InciteUprising,
+            MissionKind::Espionage,
+            MissionKind::Assassination,
+            MissionKind::Abduction,
+            MissionKind::Rescue,
+            MissionKind::DeathStarSabotage,
+            MissionKind::Sabotage,
+        ];
+        let keys: Vec<_> = order.iter().map(|kind| kind.dialog_key()).collect();
+        assert_eq!(keys, [1, 3, 4, 5, 6, 7, 8, 9, 11, 12, 13, 14, 15]);
+        assert!(order
+            .iter()
+            .all(|kind| kind.dialog_key() < MissionKind::Move.dialog_key()));
     }
 
     #[test]
