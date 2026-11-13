@@ -103,6 +103,10 @@ pub enum CommandRefusal {
     OnMission,
     /// Held prisoner (`+0xac` bit 0).
     Prisoner,
+    /// Admiral for a character that is not aboard a fleet: `FUN_0055f160`
+    /// refuses kind 2 with status `(0x30, 5)` when `FUN_0055ed30` finds no
+    /// fleet above the character.
+    NotAboard,
     /// None with no rank held, or a rank its `can_be_*` flag denies.
     NotEligible,
 }
@@ -138,6 +142,11 @@ pub fn command_refusal(
     }
     if c.en_route || command_post(c).is_none() {
         return Some(CommandRefusal::EnRoute);
+    }
+    // FUN_0055f160 (0x55f2a0): an Admiral needs a fleet, which
+    // FUN_0055ed30 finds only through a ship the character rides.
+    if kind == CommandKind::Admiral && c.current_fleet.is_none() {
+        return Some(CommandRefusal::NotAboard);
     }
     let eligible = match kind {
         CommandKind::None => c.command_kind != CommandKind::None,
@@ -227,6 +236,56 @@ pub fn clear_lapsed_ranks(world: &mut GameWorld) {
         if lapsed {
             c.command_kind = CommandKind::None;
             c.command_post = None;
+        }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::world::{Fleet, System};
+
+    /// A recruited character of `is_alliance`'s side able to hold every rank,
+    /// standing at a system or riding a fleet there.
+    fn officer(aboard: bool, is_alliance: bool) -> (GameWorld, CharacterKey) {
+        let mut world = GameWorld::default();
+        let system = world.systems.insert(System::default());
+        let fleet = world.fleets.insert(Fleet {
+            location: system,
+            is_alliance,
+            ..Fleet::default()
+        });
+        let character = world.characters.insert(Character {
+            is_alliance,
+            is_empire: !is_alliance,
+            recruited: true,
+            can_be_admiral: true,
+            can_be_commander: true,
+            can_be_general: true,
+            current_system: Some(system),
+            current_fleet: aboard.then_some(fleet),
+            ..Character::default()
+        });
+        (world, character)
+    }
+
+    /// `FUN_0055f160` (0x55f2a0) refuses kind 2 with `(0x30, 5)` when
+    /// `FUN_0055ed30` finds no fleet above the character; Commander and
+    /// General stay open at a system.
+    #[test]
+    fn an_admiral_must_ride_a_fleet_on_either_side() {
+        for is_alliance in [true, false] {
+            let (world, character) = officer(false, is_alliance);
+            let refusal = |kind| command_refusal(&world, character, is_alliance, kind);
+            assert_eq!(refusal(CommandKind::Admiral), Some(CommandRefusal::NotAboard));
+            assert_eq!(refusal(CommandKind::General), None);
+            assert_eq!(refusal(CommandKind::Commander), None);
+
+            let (world, character) = officer(true, is_alliance);
+            assert_eq!(
+                command_refusal(&world, character, is_alliance, CommandKind::Admiral),
+                None
+            );
         }
     }
 }

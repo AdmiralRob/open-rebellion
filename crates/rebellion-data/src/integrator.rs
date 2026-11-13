@@ -2052,6 +2052,7 @@ impl AiRefusal {
                     C::EnRoute => "EnRoute",
                     C::OnMission => "OnMission",
                     C::Prisoner => "Prisoner",
+                    C::NotAboard => "NotAboard",
                     C::NotEligible => "NotEligible",
                 }
             ),
