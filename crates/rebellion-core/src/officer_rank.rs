@@ -269,6 +269,82 @@ mod tests {
         (world, character)
     }
 
+    /// Every gate of `FUN_004f9860` -> `FUN_004ed750` refuses on its own
+    /// condition, for either side: a rank is reached only once all of them
+    /// pass. A character standing at a system may be Commander.
+    #[test]
+    fn each_command_gate_refuses_on_its_own_condition() {
+        for is_alliance in [true, false] {
+            let refused = |edit: fn(&mut Character)| {
+                let (mut world, character) = officer(false, is_alliance);
+                edit(&mut world.characters[character]);
+                command_refusal(&world, character, is_alliance, CommandKind::Commander)
+            };
+            assert_eq!(refused(|_| {}), None, "{is_alliance}");
+            // +0x24 bits 6..7: the other side's, and the dead.
+            assert_eq!(
+                refused(|c| {
+                    c.is_alliance = !c.is_alliance;
+                    c.is_empire = !c.is_empire;
+                }),
+                Some(CommandRefusal::OtherSide)
+            );
+            assert_eq!(
+                refused(|c| c.is_killed = true),
+                Some(CommandRefusal::OtherSide)
+            );
+            assert_eq!(
+                refused(|c| c.recruited = false),
+                Some(CommandRefusal::Unrecruited)
+            );
+            // Either mission flag is enough (+0x78 bit 8 hides the mission).
+            assert_eq!(
+                refused(|c| c.on_mission = true),
+                Some(CommandRefusal::OnMission)
+            );
+            assert_eq!(
+                refused(|c| c.on_hidden_mission = true),
+                Some(CommandRefusal::OnMission)
+            );
+            assert_eq!(
+                refused(|c| c.is_captive = true),
+                Some(CommandRefusal::Prisoner)
+            );
+            // En route, or at no post at all: either refuses.
+            assert_eq!(
+                refused(|c| c.en_route = true),
+                Some(CommandRefusal::EnRoute)
+            );
+            assert_eq!(
+                refused(|c| c.current_system = None),
+                Some(CommandRefusal::EnRoute)
+            );
+            assert_eq!(
+                refused(|c| c.can_be_commander = false),
+                Some(CommandRefusal::NotEligible)
+            );
+        }
+    }
+
+    /// Taking a rank away (kind 0) needs one held: the order is refused for
+    /// a character who holds none.
+    #[test]
+    fn the_none_rank_is_offered_only_to_a_character_who_holds_one() {
+        for is_alliance in [true, false] {
+            let (mut world, character) = officer(false, is_alliance);
+            assert_eq!(
+                command_refusal(&world, character, is_alliance, CommandKind::None),
+                Some(CommandRefusal::NotEligible),
+                "{is_alliance}: no rank to take away"
+            );
+            world.characters[character].command_kind = CommandKind::Commander;
+            assert_eq!(
+                command_refusal(&world, character, is_alliance, CommandKind::None),
+                None
+            );
+        }
+    }
+
     /// `FUN_0055f160` (0x55f2a0) refuses kind 2 with `(0x30, 5)` when
     /// `FUN_0055ed30` finds no fleet above the character; Commander and
     /// General stay open at a system.

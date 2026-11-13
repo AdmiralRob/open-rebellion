@@ -3717,6 +3717,36 @@ mod tests {
         );
     }
 
+    /// A drag carries the selected rows of the pressed row's kind only: a
+    /// character and a special force travel as one `0x241` team, regiments
+    /// with regiments and squadrons with squadrons. Each page lists one
+    /// kind (personnel holds both member kinds), so this guard holds the
+    /// rule for a page that ever mixes them.
+    #[test]
+    fn a_drag_carries_only_the_rows_of_the_pressed_rows_kind() {
+        let character = DefensesItem::Character(CharacterKey::default());
+        let force = DefensesItem::SpecialForce(SpecialForceKey::default());
+        let troop = DefensesItem::Troop(TroopKey::default());
+        let squadron = DefensesItem::Squadron {
+            class: FighterKey::default(),
+            nth: 0,
+        };
+        for (one, other) in [(character, force), (force, character)] {
+            assert!(one.drags_with(other));
+        }
+        for kind in [character, force, troop, squadron] {
+            assert!(kind.drags_with(kind));
+        }
+        for (one, other) in [
+            (character, troop),
+            (troop, character),
+            (troop, squadron),
+            (squadron, force),
+        ] {
+            assert!(!one.drags_with(other), "{one:?} with {other:?}");
+        }
+    }
+
     /// `CoolDragList` (`FUN_006083c0`): Ctrl adds a row to the selection,
     /// a drag from a selected row carries the whole selection as one team
     /// (`0x29a` takes the list's selection), and the pop-up menu's orders

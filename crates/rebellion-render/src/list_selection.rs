@@ -243,7 +243,41 @@ mod tests {
         click(&mut selection, 1, CTRL);
         selection.press_empty(CTRL);
         assert_eq!(selection.items(), [10, 11]);
+        assert!(!selection.is_empty(), "Ctrl keeps the selection");
         selection.press_empty(PLAIN);
         assert!(selection.is_empty());
+    }
+
+    /// The rows sit in a grid, so the box spans whole rows and columns, not
+    /// a run of list positions: in a grid three wide, the cells from 4 to 6
+    /// cover columns 0-1 of rows 1-2 and leave row 0 out.
+    #[test]
+    fn the_shift_box_counts_rows_down_the_grid() {
+        let mut selection = ListSelection::default();
+        click(&mut selection, 4, PLAIN);
+        click(&mut selection, 6, SHIFT);
+        assert_eq!(selection.items(), [14, 13, 16]);
+    }
+
+    /// A refill drops the rows that left the page (`retain`), and with them a
+    /// press waiting on one; a press on a row that stays keeps waiting, so
+    /// its release still applies the press's rule.
+    #[test]
+    fn a_refill_drops_the_rows_that_left_and_any_press_waiting_on_one() {
+        let mut selection = ListSelection::default();
+        click(&mut selection, 0, PLAIN);
+        click(&mut selection, 1, CTRL);
+
+        selection.press(&ROWS, 3, 1, PLAIN);
+        selection.retain(|item| item != 11);
+        assert_eq!(selection.items(), [10], "the row that left is dropped");
+        selection.release(&ROWS, 3, 1, PLAIN);
+        assert_eq!(selection.items(), [10], "its waiting press went with it");
+
+        click(&mut selection, 1, CTRL);
+        selection.press(&ROWS, 3, 1, PLAIN);
+        selection.retain(|_| true);
+        selection.release(&ROWS, 3, 1, PLAIN);
+        assert_eq!(selection.items(), [11], "a kept row's press still settles");
     }
 }
