@@ -3356,6 +3356,165 @@ mod tests {
         assert_eq!(count(ControlBucket::Neutral), 23);
     }
 
+    /// The weak buckets are drawn after the strong ones from the same
+    /// shuffled core list (`FUN_00519d00`, `+0x110` and `+0xf0`), and the
+    /// remainder stays neutral. Medium (SDPRTB 7680 20/25) with a weak row
+    /// of 10/10 over 31 core systems: 6 and 3 Alliance, 6 and 3 Empire.
+    #[test]
+    fn the_weak_buckets_take_their_own_share_after_the_strong_ones() {
+        let mut world = GameWorld::default();
+        world.sdprtb =
+            rebellion_core::world::SdprtbParams::new(vec![sd(7680, 20, 25), sd(7681, 10, 10)]);
+        let core = group_sector(&mut world, SectorGroup::Core);
+        let rim = group_sector(&mut world, SectorGroup::RimOuter);
+        let coruscant = bare_system(&mut world, ControlKind::Controlled(Faction::Empire));
+        world.systems[coruscant].sector = core;
+        let yavin = bare_system(&mut world, ControlKind::Controlled(Faction::Alliance));
+        world.systems[yavin].sector = rim;
+        let hq = bare_system(&mut world, ControlKind::Controlled(Faction::Alliance));
+        world.systems[hq].sector = rim;
+        for _ in 0..30 {
+            let key = bare_system(&mut world, ControlKind::Uncontrolled);
+            world.systems[key].sector = core;
+        }
+        let special = SpecialSystems {
+            coruscant,
+            yavin,
+            rebel_hq: hq,
+            rebel_hq_seq_id: 0,
+        };
+        let mut rng = Xoshiro256PlusPlus::seed_from_u64(7);
+
+        let buckets =
+            assign_control_buckets(&mut world, &special, &SeedOptions::default(), &mut rng);
+
+        let count = |bucket| buckets.values().filter(|b| **b == bucket).count();
+        assert_eq!(count(ControlBucket::AllianceStrong), 6);
+        assert_eq!(count(ControlBucket::AllianceWeak), 3);
+        assert_eq!(count(ControlBucket::EmpireStrong), 6);
+        assert_eq!(count(ControlBucket::EmpireWeak), 3);
+        assert_eq!(count(ControlBucket::Neutral), 12);
+        // Every core system but Coruscant lands in exactly one bucket.
+        assert_eq!(buckets.len(), 30);
+    }
+
+    /// The three special systems are set aside before the buckets are drawn
+    /// (`FUN_00519d00` moves Coruscant, Yavin and the headquarters to its
+    /// own list), so none of them is bucketed even in a core sector.
+    #[test]
+    fn no_special_system_is_bucketed_even_when_it_sits_in_a_core_sector() {
+        let mut world = GameWorld::default();
+        world.sdprtb =
+            rebellion_core::world::SdprtbParams::new(vec![sd(7680, 50, 50), sd(7681, 50, 50)]);
+        let core = group_sector(&mut world, SectorGroup::Core);
+        let coruscant = bare_system(&mut world, ControlKind::Controlled(Faction::Empire));
+        let yavin = bare_system(&mut world, ControlKind::Controlled(Faction::Alliance));
+        let hq = bare_system(&mut world, ControlKind::Controlled(Faction::Alliance));
+        for key in [coruscant, yavin, hq] {
+            world.systems[key].sector = core;
+        }
+        for _ in 0..10 {
+            let key = bare_system(&mut world, ControlKind::Uncontrolled);
+            world.systems[key].sector = core;
+        }
+        let special = SpecialSystems {
+            coruscant,
+            yavin,
+            rebel_hq: hq,
+            rebel_hq_seq_id: 0,
+        };
+        let mut rng = Xoshiro256PlusPlus::seed_from_u64(7);
+
+        let buckets =
+            assign_control_buckets(&mut world, &special, &SeedOptions::default(), &mut rng);
+
+        for (name, key) in [("Coruscant", coruscant), ("Yavin", yavin), ("the HQ", hq)] {
+            assert!(buckets.get(&key).is_none(), "{name} is not bucketed");
+        }
+        assert_eq!(buckets.len(), 10);
+    }
+
+    /// `FUN_00562710` rolls over the side's systems and its fleets together,
+    /// so a fleet is a post like any system; `FUN_0055fe70` boards the
+    /// character once, however often the post is given.
+    #[test]
+    fn a_random_post_may_be_a_fleet_and_boarding_it_lists_the_character_once() {
+        use rebellion_core::world::{Character, Fleet};
+        for side in [Faction::Alliance, Faction::Empire] {
+            let is_alliance = side == Faction::Alliance;
+            let mut world = GameWorld::default();
+            let system = bare_system(&mut world, ControlKind::Controlled(side));
+            let fleet = world.fleets.insert(Fleet {
+                location: system,
+                is_alliance,
+                ..Fleet::default()
+            });
+            let character = world.characters.insert(Character {
+                is_alliance,
+                is_empire: !is_alliance,
+                ..Character::default()
+            });
+
+            let posts: Vec<Option<StartPost>> = (0..32)
+                .map(|seed| {
+                    let mut rng = Xoshiro256PlusPlus::seed_from_u64(seed);
+                    random_start_post(&world, side, &mut rng)
+                })
+                .collect();
+            for post in [StartPost::System(system), StartPost::Fleet(fleet)] {
+                assert!(
+                    posts.contains(&Some(post)),
+                    "{side:?}: {post:?} is never drawn"
+                );
+            }
+            assert!(posts.iter().all(Option::is_some), "{side:?}");
+
+            place_character(&mut world, character, StartPost::Fleet(fleet));
+            place_character(&mut world, character, StartPost::Fleet(fleet));
+            assert_eq!(world.fleets[fleet].characters, [character], "{side:?}");
+            assert_eq!(world.characters[character].current_fleet, Some(fleet));
+            assert_eq!(world.characters[character].current_system, Some(system));
+        }
+    }
+
+    /// Taking the last of a side's recruits marks its pool empty
+    /// (`FUN_0052f590`, side `+0xb8`); taking one of two does not.
+    #[test]
+    fn taking_the_last_recruit_marks_the_sides_pool_empty() {
+        use rebellion_core::world::Character;
+        for (pool_size, expected) in [(2, false), (1, true)] {
+            for side in [Faction::Alliance, Faction::Empire] {
+                let is_alliance = side == Faction::Alliance;
+                let mut world = GameWorld::default();
+                world.sdprtb = rebellion_core::world::SdprtbParams::new(vec![sd(5120, 1, 1)]);
+                let system = bare_system(&mut world, ControlKind::Controlled(side));
+                let _ = system;
+                for index in 0..pool_size {
+                    world.characters.insert(Character {
+                        dat_id: DatId::new(0x350 + index),
+                        is_alliance,
+                        is_empire: !is_alliance,
+                        ..Character::default()
+                    });
+                }
+                let mut rng = Xoshiro256PlusPlus::seed_from_u64(3);
+
+                place_extra_recruits(&mut world, side, &SeedOptions::default(), &mut rng);
+
+                assert_eq!(
+                    world.characters.values().filter(|c| c.recruited).count(),
+                    1,
+                    "{side:?}: SDPRTB 5120 places one recruit"
+                );
+                assert_eq!(
+                    world.recruit_pool_empty(side),
+                    expected,
+                    "{side:?}: pool of {pool_size}"
+                );
+            }
+        }
+    }
+
     /// Stage 0x15 (`FUN_0055f7b0`): Palpatine at Coruscant, Mon Mothma at the
     /// HQ, Luke, Leia, Han and minors 0x341/0x343/0x344 at Yavin; Vader and
     /// minors 0x380-0x383, 0x38c each at a random system or fleet of the
