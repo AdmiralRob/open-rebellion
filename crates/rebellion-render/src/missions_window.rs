@@ -1528,9 +1528,9 @@ fn draw_missions_windows_with_snapshot(
         .into_iter()
         .map(MissionsWindowAction::Close)
         .collect::<Vec<_>>();
-    if snapshot.is_none() {
-        state.update_title_drag(ctx, layout);
-    }
+    // The managed windows move as the fixtures do (FUN_00606ee0 takes hold,
+    // FUN_006071e0 places the window live), as the Defenses window does.
+    state.update_title_drag(ctx, layout);
     for window in &windows {
         let focused = match window.id {
             Some(id) => focused_manager == Some(id),
@@ -3898,6 +3898,86 @@ mod tests {
         assert_eq!(
             state.report(&world, &fog, &missions, system).unwrap().tab,
             MissionsTab::Decoys
+        );
+    }
+
+    /// `frames`' events with the primary press and release routed to the
+    /// window, as the game's router does for a press over it.
+    fn routed(frames: Vec<Vec<egui::Event>>) -> Vec<(Vec<egui::Event>, Vec<PointerPhase>)> {
+        let mut held = false;
+        frames
+            .into_iter()
+            .map(|events| {
+                let mut phases = Vec::new();
+                for event in &events {
+                    match event {
+                        egui::Event::PointerButton { pressed, .. } => {
+                            held = *pressed;
+                            phases.push(if *pressed {
+                                PointerPhase::Press(PointerButtonId::Primary)
+                            } else {
+                                PointerPhase::Release(PointerButtonId::Primary)
+                            });
+                        }
+                        egui::Event::PointerMoved(_) if held => {
+                            phases.push(PointerPhase::Motion(PointerButtonId::Primary));
+                        }
+                        _ => {}
+                    }
+                }
+                (events, phases)
+            })
+            .collect()
+    }
+
+    fn managed_opened(
+        world: &GameWorld,
+        missions: &MissionState,
+        system: SystemKey,
+    ) -> (WindowManager, MissionsWindowState, WindowId) {
+        let mut manager = WindowManager::new();
+        let mut state = MissionsWindowState::default();
+        let prepared = state
+            .prepare_open(
+                world,
+                &unseen(),
+                missions,
+                system,
+                ORIGIN,
+                CockpitFaction::Alliance,
+                scaled(),
+            )
+            .unwrap();
+        let (id, _) = commit_prepared_missions_window(&mut manager, &mut state, prepared);
+        (manager, state, id)
+    }
+
+    /// The game's windows are managed: the close button (`0x14`) and a drag
+    /// on the bare surface (`FUN_00606ee0`) work there too, not only in the
+    /// direct fixtures.
+    #[test]
+    fn a_managed_missions_window_closes_from_its_button_and_moves_by_its_title() {
+        let (world, system, missions, _) = busy();
+        let (manager, mut state, id) = managed_opened(&world, &missions, system);
+        let closed = run_managed(&world, &missions, &mut state, &manager, routed(click(at(224.0, 9.0))));
+        assert!(
+            closed.actions.contains(&MissionsWindowAction::Close(id)),
+            "{:?}",
+            closed.actions
+        );
+
+        let (manager, mut state, _) = managed_opened(&world, &missions, system);
+        let start = at(100.0, 9.0);
+        let _ = run_managed(
+            &world,
+            &missions,
+            &mut state,
+            &manager,
+            routed(title_drag(start, start + egui::vec2(40.0, 40.0))),
+        );
+        assert_eq!(
+            state.windows[0].logical_position,
+            (ORIGIN.0 + 20, ORIGIN.1 + 20)
         );
     }
 
